@@ -162,10 +162,10 @@ def gen_implicit_velocity(samples_per_prompt):
         for _ in range(samples_per_prompt):
             # We choose v and m first to ensure clean numbers, then calc KE
             v = np.random.randint(2, 100) # Keep numbers simple
-            m = np.random.randint(1, 100)
+            m = np.random.randint(1, 20)
             obj = np.random.choice(objects)
             ke = 0.5 * m * (v ** 2)
-            d = np.random.randint(10, 100)  # Random distance for the travel time question
+            d = np.random.randint(10, 100, 10)  # Random distance for the travel time question
         
             # Prompt: "Mass is 2kg. Energy is {KE} Joules. Therefore the velocity is"
             # We want to see if the model has 'v' ready BEFORE it generates the number.
