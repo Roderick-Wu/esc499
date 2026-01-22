@@ -791,7 +791,7 @@ for test_idx in range(len(test_prompts)):
             _, cache = model.run_with_cache(input_ids, names_filter=[hook_name])
         
         layer_acts = cache[hook_name][0]  # [seq_len, d_model]
-        activations_dict[layer] = layer_acts.cpu().numpy()
+        activations_dict[layer] = layer_acts.cpu().float().numpy()  # Convert bfloat16 to float32 first
     
     n_tokens = len(token_strings)
     n_layers = len(LAYERS_TO_TEST)
