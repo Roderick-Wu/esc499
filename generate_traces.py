@@ -14,7 +14,6 @@ Usage:
 
 import torch
 import numpy as np
-from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 import json
@@ -64,30 +63,21 @@ print()
 # ==========================================
 
 print("Loading model...")
-hf_model = AutoModelForCausalLM.from_pretrained(
-    args.model_path,
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
-)
+print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
-model = HookedTransformer.from_pretrained(
-    "Qwen/Qwen2.5-32B",
-    hf_model=hf_model,
-    tokenizer=tokenizer,
-    dtype=torch.bfloat16,
-    fold_ln=False,
-    center_writing_weights=False,
-    fold_value_biases=False,
-    move_to_device=False
+print("Loading HuggingFace model with device_map='auto'...")
+model = AutoModelForCausalLM.from_pretrained(
+    args.model_path,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    low_cpu_mem_usage=True,
 )
 
-if model.embed.W_E.device.type == 'cpu':
-    model.embed = model.embed.to('cuda:0')
-if hasattr(model, 'pos_embed') and model.pos_embed.W_pos.device.type == 'cpu':
-    model.pos_embed = model.pos_embed.to('cuda:0')
+n_layers = model.config.num_hidden_layers
+d_model = model.config.hidden_size
 
-print(f"Model loaded: {model.cfg.n_layers} layers, {model.cfg.d_model} dimensions\n")
+print(f"Model loaded: {n_layers} layers, {d_model} dimensions\n")
 
 # ==========================================
 # PROMPT GENERATION (NO DUPLICATES)
@@ -135,6 +125,8 @@ def generate_unique_velocity_prompts(n_prompts):
         expected_time = d / v
         
         prompt = prompt_format.format(m=m, obj=obj, ke=f"{ke:.3e}", d=d)
+
+        prompt = "Question: " + prompt + " Answer (step-by-step): "
         
         prompts_data.append({
             'prompt': prompt,
@@ -186,6 +178,8 @@ def generate_unique_current_prompts(n_prompts):
         expected_charge = current * t  # Q = I * t
         
         prompt = prompt_format.format(obj=obj, r=r, p=p, t=t)
+
+        prompt = "Question: " + prompt + " \nAnswer (step-by-step): "
         
         prompts_data.append({
             'prompt': prompt,
@@ -204,9 +198,10 @@ def generate_unique_current_prompts(n_prompts):
 # TRACE GENERATION
 # ==========================================
 
-def generate_trace_with_activations(prompt_text, model, max_new_tokens=512):
+def generate_trace_with_activations(prompt_text, model, tokenizer, max_new_tokens=256):
     """
-    Generate CoT response and cache activations from ALL layers for ALL tokens.
+    Generate CoT response using HuggingFace generate() with hidden states.
+    Much faster than TransformerLens for pure generation.
     
     Returns:
         Dictionary with:
@@ -216,68 +211,57 @@ def generate_trace_with_activations(prompt_text, model, max_new_tokens=512):
             - generated_text: Full generated text
             - activations: Dict mapping layer -> tensor of shape [seq_len, d_model]
     """
-    embed_device = model.embed.W_E.device
-    prompt_tokens = model.to_tokens(prompt_text, prepend_bos=True).to(embed_device)
-    all_tokens = prompt_tokens.clone()
-    prompt_length = prompt_tokens.shape[1]
-    
-    # Store activations for each layer
-    all_layer_activations = {layer: [] for layer in range(model.cfg.n_layers)}
+    # Tokenize input
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    prompt_length = inputs.input_ids.shape[1]
     
     print(f"    Generating (max {max_new_tokens} tokens)...", end='', flush=True)
     
-    for step in range(max_new_tokens):
-        # Run model with cache for ALL layers
-        with torch.no_grad():
-            _, cache = model.run_with_cache(all_tokens)
-        
-        # Extract activations from all layers for the last token
-        for layer in range(model.cfg.n_layers):
-            hook_name = f"blocks.{layer}.hook_resid_post"
-            last_act = cache[hook_name][0, -1].cpu().float()  # [d_model]
-            all_layer_activations[layer].append(last_act)
-        
-        # Clear cache to save memory
-        del cache
-        if step % 20 == 0:
-            torch.cuda.empty_cache()
-            print('.', end='', flush=True)
-        
-        # Generate next token
-        with torch.no_grad():
-            logits = model(all_tokens)[0, -1]
-        
-        # Sample with temperature
-        probs = torch.softmax(logits / args.temperature, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-        mask = cumsum_probs > args.top_p
-        mask[0] = False
-        sorted_probs[mask] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum()
-        
-        next_token_idx = sorted_indices[torch.multinomial(sorted_probs, 1)].item()
-        next_token = torch.tensor([[next_token_idx]], dtype=all_tokens.dtype, device=embed_device)
-        
-        # Check for EOS
-        if next_token_idx == model.tokenizer.eos_token_id:
-            print(" [EOS]")
-            break
-        
-        all_tokens = torch.cat([all_tokens, next_token], dim=1)
+    # Generate with hidden states (greedy decoding for determinism)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,  # Use greedy decoding (top-1 sampling)
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
     
-    if all_tokens.shape[1] - prompt_length >= max_new_tokens:
-        print(" [MAX]")
+    # Extract generated tokens
+    generated_ids = outputs.sequences[0]
+    token_ids = generated_ids.cpu().tolist()
+    token_strings = [tokenizer.decode([tid]) for tid in token_ids]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
     
-    # Convert tokens to lists
-    token_ids = all_tokens[0].cpu().tolist()
-    token_strings = [model.to_string(all_tokens[0, i:i+1]) for i in range(len(token_ids))]
-    generated_text = model.to_string(all_tokens[0])
+    # Extract hidden states from all layers
+    # outputs.hidden_states is a tuple of tuples:
+    # - Outer tuple: one per generated token
+    # - Inner tuple: one per layer (including embedding)
+    # Each element: [batch, seq_len, hidden_size]
+    
+    n_layers = model.config.num_hidden_layers
+    all_layer_activations = {layer: [] for layer in range(n_layers)}
+    
+    # For each generated token
+    for step_hidden_states in outputs.hidden_states:
+        # step_hidden_states is a tuple of (n_layers + 1) tensors
+        # Index 0 is embeddings, indices 1 to n_layers are transformer layers
+        for layer in range(n_layers):
+            # Get the last token's hidden state for this layer
+            hidden_state = step_hidden_states[layer + 1][0, -1].cpu().float()  # [d_model]
+            all_layer_activations[layer].append(hidden_state)
+    
+    print(f" [Generated {len(token_ids) - prompt_length} tokens]")
     
     # Stack activations for each layer
     stacked_activations = {}
-    for layer in range(model.cfg.n_layers):
-        stacked_activations[layer] = torch.stack(all_layer_activations[layer], dim=0).numpy()
+    for layer in range(n_layers):
+        if all_layer_activations[layer]:
+            stacked_activations[layer] = torch.stack(all_layer_activations[layer], dim=0).numpy()
+        else:
+            # If no tokens were generated, use zeros
+            stacked_activations[layer] = np.zeros((0, model.config.hidden_size), dtype=np.float32)
     
     return {
         'tokens': token_ids,
@@ -310,7 +294,8 @@ for idx, prompt_data in enumerate(tqdm(prompts_data, desc="Generating traces")):
     
     trace = generate_trace_with_activations(
         prompt_data['prompt'], 
-        model, 
+        model,
+        tokenizer,
         max_new_tokens=args.max_new_tokens
     )
     
@@ -329,7 +314,7 @@ for idx, prompt_data in enumerate(tqdm(prompts_data, desc="Generating traces")):
     np.savez_compressed(
         activations_file,
         **{f"layer_{layer}": trace['activations'][layer] 
-           for layer in range(model.cfg.n_layers)}
+           for layer in range(n_layers)}
     )
     
     # Save intermediate metadata every 50 prompts
@@ -357,8 +342,8 @@ config = {
     'temperature': args.temperature,
     'top_p': args.top_p,
     'seed': args.seed,
-    'n_layers': model.cfg.n_layers,
-    'd_model': model.cfg.d_model,
+    'n_layers': n_layers,
+    'd_model': d_model,
 }
 
 config_file = OUTPUT_DIR / 'config.json'

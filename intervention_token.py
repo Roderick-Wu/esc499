@@ -1,26 +1,30 @@
 """
-Token-Level Intervention for Causal Testing
+Token-Level Intervention for Causal Testing (Using Pre-Generated Traces)
 
-This script performs interventions at the token level during chain-of-thought (CoT) generation.
-It swaps computed hidden variable values (e.g., velocity) with values from a source example
+This script performs interventions at the token level using pre-generated traces.
+It swaps computed velocity values from a source example into a base example
 to test whether the model's reasoning causally depends on these intermediate values.
 
 Workflow:
-1. Generate CoT response from source example (with known correct hidden value)
-2. Generate CoT response from target example until hidden value is computed
-3. Swap the hidden value tokens from source to target
+1. Load pre-generated traces from traces_metadata.json
+2. Pair 250 prompts into 125 pairs (source, base)
+3. For each base trace:
+   - Truncate generated text at second "Question" occurrence
+   - Find first occurrence of base velocity value
+   - Replace with source velocity value
 4. Continue generation and evaluate final answer
-5. Compare swapped vs. baseline to measure causal dependence
+5. Compare intervention results with expected values
 
-Key Challenge: Multi-token numbers require careful token alignment
+Key features:
+- Uses existing traces instead of generating new ones
+- Handles velocity value matching with tolerance for significant digits
+- Computes expected time using base distance / source velocity
 """
 
 import torch
 import numpy as np
-from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
-import prompt_functions
 import json
 import re
 from typing import List, Tuple, Optional, Dict
@@ -35,16 +39,14 @@ EXPERIMENT = "velocity"  # Options: 'velocity', 'current', 'radius', etc.
 # Model configuration
 MODEL_PATH = "/home/wuroderi/projects/def-zhijing/wuroderi/models/Qwen2.5-32B"
 
-# Generation configuration
-MAX_TOKENS_BEFORE_VALUE = 300  # Max tokens to generate before expecting the value
-MAX_TOKENS_AFTER_VALUE = 200   # Max tokens to continue after intervention
-TEMPERATURE = 0.7
-TOP_P = 0.9
+# Traces directory
+TRACES_DIR = Path("/home/wuroderi/scratch/reasoning_traces/Qwen2.5-32B/velocity")
+TRACES_METADATA_FILE = TRACES_DIR / "traces_metadata.json"
 
-# Intervention configuration
-N_SOURCE_SAMPLES = 10   # Number of source examples to use
-N_TARGET_SAMPLES = 10   # Number of target examples to test
-SWAP_STRATEGY = "exact"  # Options: 'exact' (swap all value tokens), 'first' (swap first occurrence)
+# Generation configuration
+MAX_TOKENS_AFTER_INTERVENTION = 256  # Max tokens to continue after intervention
+TEMPERATURE = 0.0  # Use greedy decoding for consistency
+TOP_P = 1.0
 
 # Output configuration
 OUTPUT_DIR = Path("/home/wuroderi/projects/def-zhijing/wuroderi/reasoning_abstraction/intervention_token_results")
@@ -53,11 +55,24 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("="*70)
-print("TOKEN-LEVEL INTERVENTION FOR CAUSAL TESTING")
+print("TOKEN-LEVEL INTERVENTION (USING PRE-GENERATED TRACES)")
 print("="*70)
 print(f"Experiment: {EXPERIMENT}")
 print(f"Model: {MODEL_PATH}")
+print(f"Traces: {TRACES_DIR}")
 print(f"Output: {OUTPUT_DIR}")
+print()
+
+# ==========================================
+# LOAD TRACES
+# ==========================================
+
+print("Loading traces metadata...")
+with open(TRACES_METADATA_FILE, 'r') as f:
+    traces = json.load(f)
+
+print(f"Loaded {len(traces)} traces")
+print(f"  Example trace keys: {list(traces[0].keys())[:10]}")
 print()
 
 # ==========================================
@@ -65,54 +80,72 @@ print()
 # ==========================================
 
 print("Loading model...")
-hf_model = AutoModelForCausalLM.from_pretrained(
+model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
     device_map="auto"
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
-model = HookedTransformer.from_pretrained(
-    "Qwen/Qwen2.5-32B",
-    hf_model=hf_model,
-    tokenizer=tokenizer,
-    dtype=torch.bfloat16,
-    fold_ln=False,
-    center_writing_weights=False,
-    fold_value_biases=False,
-    move_to_device=False
-)
-
-if model.embed.W_E.device.type == 'cpu':
-    model.embed = model.embed.to('cuda:0')
-if hasattr(model, 'pos_embed') and model.pos_embed.W_pos.device.type == 'cpu':
-    model.pos_embed = model.pos_embed.to('cuda:0')
-
-print(f"Model loaded: {model.cfg.n_layers} layers\n")
+print(f"Model loaded: {model.config.num_hidden_layers} layers\n")
 
 # ==========================================
 # UTILITY FUNCTIONS
 # ==========================================
 
-def extract_number_from_text(text: str) -> Optional[float]:
-    """Extract the first numerical value from generated text."""
-    # Look for numbers in various formats
+def truncate_at_second_question(text: str) -> str:
+    """
+    Truncate text at the second occurrence of 'Question'.
+    This removes extra questions the model generates after answering.
+    """
+    parts = text.split('Question')
+    if len(parts) >= 3:
+        # Keep first two parts (before first Question, and between first and second Question)
+        return 'Question'.join(parts[:2]) + 'Question'
+    return text
+
+def find_velocity_in_text(text: str, velocity: float, tolerance: float = 1.0) -> Optional[Tuple[int, int, str]]:
+    """
+    Find the first occurrence of a velocity value in text.
+    Returns (start_pos, end_pos, matched_string) or None.
+    
+    Args:
+        text: Generated text to search
+        velocity: Velocity value to find (e.g., 74)
+        tolerance: Matching tolerance for approximate matches
+    
+    Returns:
+        Tuple of (start_position, end_position, matched_text) or None
+    """
+    # Try matching different representations
+    # Pattern: number optionally followed by decimal and digits, possibly followed by m/s
     patterns = [
-        r'velocity.*?([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
-        r'current.*?([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
-        r'speed.*?([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
-        r'=\s*([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
-        r'([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)\s*m/s',
-        r'([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)\s*(?:amperes?|A\b)',
+        # Exact integer match
+        rf'\b{int(velocity)}\b(?!\.\d)',
+        # With decimal point and trailing zeros
+        rf'\b{int(velocity)}\.0+\b',
+        # With decimal point and one digit
+        rf'\b{velocity:.1f}\b',
+        # With decimal point and two digits
+        rf'\b{velocity:.2f}\b',
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            try:
-                return float(match.group(1))
-            except:
-                continue
+        matches = list(re.finditer(pattern, text))
+        if matches:
+            match = matches[0]  # Get first occurrence
+            return (match.start(), match.end(), match.group())
+    
+    # Try fuzzy matching - look for any number close to the velocity
+    number_pattern = r'\b(\d+\.?\d*)\b'
+    for match in re.finditer(number_pattern, text):
+        try:
+            value = float(match.group(1))
+            if abs(value - velocity) <= tolerance:
+                return (match.start(), match.end(), match.group())
+        except:
+            continue
+    
     return None
 
 def extract_final_answer(text: str) -> Optional[float]:
@@ -120,7 +153,8 @@ def extract_final_answer(text: str) -> Optional[float]:
     # Look for final answer patterns
     patterns = [
         r'(?:answer|result|final|therefore).*?([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
-        r'([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)\s*(?:seconds?|meters?|m\b|s\b)',
+        r'([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)\s*(?:seconds?|s\b)',
+        r't\s*=\s*([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)',
     ]
     
     # Try to get the last number that looks like an answer
@@ -132,339 +166,221 @@ def extract_final_answer(text: str) -> Optional[float]:
             except:
                 continue
     
-    # Fallback: get any number
-    numbers = re.findall(r'([0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?)', text)
-    if numbers:
+    # Fallback: get any number after "answer is"
+    answer_pattern = r'answer is\s+([0-9]+\.?[0-9]*)'
+    match = re.search(answer_pattern, text, re.IGNORECASE)
+    if match:
         try:
-            return float(numbers[-1])
+            return float(match.group(1))
         except:
             pass
     
     return None
 
-def tokenize_number(number: float, tokenizer) -> List[int]:
+def replace_velocity_in_text(text: str, old_velocity: float, new_velocity: float) -> Optional[str]:
     """
-    Tokenize a number to see how it's represented.
-    Important: Numbers can be split into multiple tokens!
-    """
-    # Try different representations
-    representations = [
-        str(int(number)) if number == int(number) else str(number),
-        f" {int(number)}" if number == int(number) else f" {number}",
-        f" {int(number)} " if number == int(number) else f" {number} ",
-    ]
+    Replace the first occurrence of old_velocity with new_velocity in text.
     
-    # Return the tokenization of the most common representation
-    tokens = tokenizer(representations[1], add_special_tokens=False)['input_ids']
-    return tokens
-
-def find_value_in_tokens(token_ids: List[int], value: float, tokenizer, 
-                         context_window: int = 5) -> Optional[Tuple[int, int]]:
+    Returns:
+        Modified text with substitution, or None if velocity not found
     """
-    Find where a value appears in a token sequence.
-    Returns (start_idx, end_idx) if found, else None.
+    result = find_velocity_in_text(text, old_velocity)
+    if result is None:
+        return None
+    
+    start_pos, end_pos, matched_text = result
+    
+    # Format new velocity to match the style of the matched text
+    if '.' in matched_text:
+        # Has decimal point - preserve number of decimal places
+        decimal_places = len(matched_text.split('.')[-1])
+        new_velocity_str = f"{new_velocity:.{decimal_places}f}"
+    else:
+        # Integer format
+        new_velocity_str = str(int(new_velocity))
+    
+    # Replace in text
+    modified_text = text[:start_pos] + new_velocity_str + text[end_pos:]
+    
+    return modified_text
+
+def continue_generation_from_text(model, tokenizer, text: str, max_new_tokens: int = 256) -> str:
+    """
+    Continue generation from a partial text string.
     
     Args:
-        token_ids: List of token IDs
-        value: Numerical value to find
-        tokenizer: Tokenizer
-        context_window: How many tokens before/after to check for the value
+        model: The language model
+        tokenizer: The tokenizer
+        text: The text to continue from
+        max_new_tokens: Maximum number of new tokens to generate
     
     Returns:
-        Tuple of (start_idx, end_idx) where the value tokens are, or None
+        Complete generated text (including input text)
     """
-    value_tokens = tokenize_number(value, tokenizer)
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
     
-    # Search for the value token sequence
-    for i in range(len(token_ids) - len(value_tokens) + 1):
-        if token_ids[i:i+len(value_tokens)] == value_tokens:
-            return (i, i + len(value_tokens))
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=(TEMPERATURE > 0),
+            temperature=TEMPERATURE if TEMPERATURE > 0 else None,
+            top_p=TOP_P if TEMPERATURE > 0 else None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
     
-    # If exact match fails, try fuzzy matching by decoding
-    # (in case of different tokenization with spaces)
-    value_str = str(int(value)) if value == int(value) else str(value)
-    
-    for i in range(len(token_ids)):
-        for length in range(1, min(5, len(token_ids) - i + 1)):
-            decoded = tokenizer.decode(token_ids[i:i+length]).strip()
-            if value_str in decoded or decoded in value_str:
-                return (i, i + length)
-    
-    return None
-
-def generate_until_value(model, prompt: str, expected_value: float, 
-                         max_tokens: int = 300) -> Optional[Tuple[torch.Tensor, int, int]]:
-    """
-    Generate tokens until the expected value appears, or max_tokens is reached.
-    
-    Returns:
-        Tuple of (all_tokens, value_start_idx, value_end_idx) or None if value not found
-    """
-    embed_device = model.embed.W_E.device
-    prompt_tokens = model.to_tokens(prompt, prepend_bos=True).to(embed_device)
-    all_tokens = prompt_tokens.clone()
-    prompt_length = prompt_tokens.shape[1]
-    
-    for step in range(max_tokens):
-        # Generate next token
-        with torch.no_grad():
-            logits = model(all_tokens)[0, -1]
-        
-        # Sample with temperature
-        probs = torch.softmax(logits / TEMPERATURE, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-        mask = cumsum_probs > TOP_P
-        mask[0] = False
-        sorted_probs[mask] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum()
-        
-        next_token_idx = sorted_indices[torch.multinomial(sorted_probs, 1)].item()
-        next_token = torch.tensor([[next_token_idx]], dtype=all_tokens.dtype, device=embed_device)
-        
-        # Check for EOS
-        if next_token_idx == model.tokenizer.eos_token_id:
-            break
-        
-        all_tokens = torch.cat([all_tokens, next_token], dim=1)
-        
-        # Check if value has appeared in generated text
-        generated_ids = all_tokens[0, prompt_length:].cpu().tolist()
-        value_position = find_value_in_tokens(generated_ids, expected_value, model.tokenizer)
-        
-        if value_position is not None:
-            start_idx = prompt_length + value_position[0]
-            end_idx = prompt_length + value_position[1]
-            return all_tokens, start_idx, end_idx
-    
-    return None
-
-def continue_generation(model, tokens: torch.Tensor, max_tokens: int = 200) -> torch.Tensor:
-    """Continue generation from current token sequence."""
-    embed_device = model.embed.W_E.device
-    all_tokens = tokens.clone()
-    
-    for step in range(max_tokens):
-        with torch.no_grad():
-            logits = model(all_tokens)[0, -1]
-        
-        probs = torch.softmax(logits / TEMPERATURE, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-        mask = cumsum_probs > TOP_P
-        mask[0] = False
-        sorted_probs[mask] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum()
-        
-        next_token_idx = sorted_indices[torch.multinomial(sorted_probs, 1)].item()
-        next_token = torch.tensor([[next_token_idx]], dtype=all_tokens.dtype, device=embed_device)
-        
-        if next_token_idx == model.tokenizer.eos_token_id:
-            break
-        
-        all_tokens = torch.cat([all_tokens, next_token], dim=1)
-    
-    return all_tokens
-
-def swap_value_tokens(target_tokens: torch.Tensor, source_value: float, 
-                      target_value_start: int, target_value_end: int,
-                      tokenizer) -> torch.Tensor:
-    """
-    Swap the target value tokens with source value tokens.
-    
-    Args:
-        target_tokens: Target token sequence [1, seq_len]
-        source_value: The value to inject
-        target_value_start: Start index of value in target
-        target_value_end: End index of value in target
-        tokenizer: Tokenizer
-    
-    Returns:
-        Modified token sequence with swapped value
-    """
-    # Get source value tokens
-    source_tokens = tokenize_number(source_value, tokenizer)
-    source_tensor = torch.tensor([source_tokens], dtype=target_tokens.dtype, 
-                                 device=target_tokens.device)
-    
-    # Replace target value tokens with source value tokens
-    before = target_tokens[:, :target_value_start]
-    after = target_tokens[:, target_value_end:]
-    
-    swapped_tokens = torch.cat([before, source_tensor, after], dim=1)
-    
-    return swapped_tokens
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    return generated_text
 
 # ==========================================
 # INTERVENTION EXPERIMENT
 # ==========================================
 
-def run_intervention_experiment(source_prompt: str, source_value: float,
-                                target_prompt: str, target_value: float,
-                                expected_answer_with_source: float,
-                                expected_answer_with_target: float) -> Dict:
+def run_intervention_experiment(source_trace: Dict, base_trace: Dict, 
+                                model, tokenizer) -> Dict:
     """
-    Run a single intervention experiment.
+    Run a single intervention experiment using pre-generated traces.
     
     Args:
-        source_prompt: Source example prompt
-        source_value: Hidden value from source (to inject)
-        target_prompt: Target example prompt
-        target_value: True hidden value in target
-        expected_answer_with_source: Expected final answer if using source value
-        expected_answer_with_target: Expected final answer if using target value
+        source_trace: Source trace with velocity to inject
+        base_trace: Base trace to intervene on
+        model: The language model
+        tokenizer: The tokenizer
     
     Returns:
         Dictionary with results
     """
+    source_velocity = source_trace['v']
+    base_velocity = base_trace['v']
+    base_distance = base_trace['d']
+    
+    # Expected time with intervention: base_distance / source_velocity
+    expected_time_with_intervention = base_distance / source_velocity
+    expected_time_baseline = base_trace['expected_time']
+    
     result = {
-        'source_value': source_value,
-        'target_value': target_value,
-        'expected_answer_with_source': expected_answer_with_source,
-        'expected_answer_with_target': expected_answer_with_target,
+        'source_id': source_trace['id'],
+        'base_id': base_trace['id'],
+        'source_velocity': source_velocity,
+        'base_velocity': base_velocity,
+        'base_distance': base_distance,
+        'expected_time_baseline': expected_time_baseline,
+        'expected_time_with_intervention': expected_time_with_intervention,
     }
     
-    # BASELINE: Generate target without intervention
-    print(f"  Generating baseline (target only)...")
-    baseline_result = generate_until_value(model, target_prompt, target_value, 
-                                          MAX_TOKENS_BEFORE_VALUE + MAX_TOKENS_AFTER_VALUE)
+    # Get base generated text
+    base_text = base_trace['generated_text']
     
-    if baseline_result is None:
-        print(f"    WARNING: Could not find target value in baseline generation")
-        result['baseline_success'] = False
+    # Step 1: Truncate at second "Question"
+    truncated_text = truncate_at_second_question(base_text)
+    result['truncated_text'] = truncated_text
+    
+    # Step 2: Find base velocity in truncated text
+    velocity_location = find_velocity_in_text(truncated_text, base_velocity)
+    
+    if velocity_location is None:
+        print(f"    WARNING: Could not find base velocity {base_velocity} in generated text")
+        result['success'] = False
+        result['error'] = 'velocity_not_found'
         return result
     
-    baseline_tokens, _, _ = baseline_result
-    baseline_text = model.to_string(baseline_tokens[0])
-    result['baseline_text'] = baseline_text
-    result['baseline_final_answer'] = extract_final_answer(baseline_text)
-    result['baseline_success'] = True
+    start_pos, end_pos, matched_text = velocity_location
+    print(f"    Found velocity: '{matched_text}' at position {start_pos}")
     
-    # INTERVENTION: Generate until value, swap, then continue
-    print(f"  Generating target until value appears...")
-    target_partial = generate_until_value(model, target_prompt, target_value, 
-                                         MAX_TOKENS_BEFORE_VALUE)
+    # Step 3: Truncate text up to and including the velocity value
+    text_up_to_velocity = truncated_text[:end_pos]
+    result['text_up_to_velocity'] = text_up_to_velocity
     
-    if target_partial is None:
-        print(f"    WARNING: Could not find target value in generation")
-        result['intervention_success'] = False
+    # Step 4: Replace velocity value
+    modified_text = replace_velocity_in_text(text_up_to_velocity, base_velocity, source_velocity)
+    
+    if modified_text is None:
+        print(f"    WARNING: Failed to replace velocity")
+        result['success'] = False
+        result['error'] = 'replacement_failed'
         return result
     
-    target_tokens, value_start, value_end = target_partial
+    result['text_with_intervention'] = modified_text
+    print(f"    Replaced {base_velocity} → {source_velocity}")
     
-    print(f"    Found value at tokens [{value_start}:{value_end}]")
-    print(f"    Swapping {target_value} → {source_value}")
-    
-    # Swap tokens
-    swapped_tokens = swap_value_tokens(target_tokens, source_value, 
-                                      value_start, value_end, model.tokenizer)
-    
-    print(f"  Continuing generation after swap...")
-    final_tokens = continue_generation(model, swapped_tokens, MAX_TOKENS_AFTER_VALUE)
-    
-    intervention_text = model.to_string(final_tokens[0])
-    result['intervention_text'] = intervention_text
-    result['intervention_final_answer'] = extract_final_answer(intervention_text)
-    result['intervention_success'] = True
-    
-    # Check if intervention changed the answer
-    if result['baseline_final_answer'] is not None and result['intervention_final_answer'] is not None:
-        result['answer_changed'] = abs(result['baseline_final_answer'] - 
-                                      result['intervention_final_answer']) > 0.5
+    # Step 5: Continue generation
+    print(f"    Continuing generation (max {MAX_TOKENS_AFTER_INTERVENTION} tokens)...")
+    try:
+        final_text = continue_generation_from_text(
+            model, tokenizer, modified_text, MAX_TOKENS_AFTER_INTERVENTION
+        )
+        result['final_text'] = final_text
         
-        # Check if answer moved toward expected value with source
-        baseline_error = abs(result['baseline_final_answer'] - expected_answer_with_target)
-        intervention_error = abs(result['intervention_final_answer'] - expected_answer_with_source)
-        result['intervention_improved_toward_source'] = intervention_error < baseline_error
+        # Extract final answer
+        final_answer = extract_final_answer(final_text)
+        result['final_answer'] = final_answer
+        
+        if final_answer is not None:
+            result['error_from_intervention_expectation'] = abs(final_answer - expected_time_with_intervention)
+            result['error_from_baseline_expectation'] = abs(final_answer - expected_time_baseline)
+            result['moved_toward_intervention'] = (
+                result['error_from_intervention_expectation'] < 
+                result['error_from_baseline_expectation']
+            )
+        
+        result['success'] = True
+        
+    except Exception as e:
+        print(f"    ERROR during generation: {e}")
+        result['success'] = False
+        result['error'] = str(e)
     
     return result
 
 # ==========================================
-# GENERATE DATA AND RUN EXPERIMENTS
+# PAIR TRACES AND RUN EXPERIMENTS
 # ==========================================
 
-print("Generating test data...")
+print("Creating pairs from traces...")
 
-# Select appropriate prompt generation function
-if EXPERIMENT == "velocity":
-    gen_implicit = lambda: prompt_functions.gen_implicit_velocity(samples_per_prompt=5)
-elif EXPERIMENT == "current":
-    gen_implicit = lambda: prompt_functions.gen_implicit_current(samples_per_prompt=5)
-else:
-    raise ValueError(f"Unknown experiment: {EXPERIMENT}")
+# Pair traces: first 125 with second 125
+n_pairs = min(125, len(traces) // 2)
+pairs = []
 
-# Generate examples
-prompts, prompt_ids, true_values = gen_implicit()
+for i in range(n_pairs):
+    source_trace = traces[i]
+    base_trace = traces[i + n_pairs]
+    pairs.append((source_trace, base_trace))
 
-# For velocity: compute expected final answers (time = distance / velocity)
-# Extract additional problem parameters from prompts for answer calculation
-def extract_problem_params(prompt: str, experiment: str) -> Dict:
-    """Extract problem parameters from prompt text."""
-    if experiment == "velocity":
-        # Extract distance from "travel {d} m"
-        match = re.search(r'travel\s+(\d+)\s*m', prompt)
-        if match:
-            distance = float(match.group(1))
-            return {'distance': distance}
-    elif experiment == "current":
-        # Extract time from "after {t} seconds"
-        match = re.search(r'after\s+(\d+)\s*seconds', prompt)
-        if match:
-            time = float(match.group(1))
-            return {'time': time}
-    return {}
-
-print(f"Generated {len(prompts)} test prompts")
-print(f"  Example: '{prompts[0][:100]}...'")
+print(f"Created {len(pairs)} pairs")
+print(f"  Example: Source trace {pairs[0][0]['id']} (v={pairs[0][0]['v']}) -> "
+      f"Base trace {pairs[0][1]['id']} (v={pairs[0][1]['v']})")
 print()
 
 # Run experiments
-print(f"Running {N_SOURCE_SAMPLES * N_TARGET_SAMPLES} intervention experiments...")
+print(f"Running {len(pairs)} intervention experiments...")
 print()
 
 all_results = []
 
-for i in range(min(N_SOURCE_SAMPLES, len(prompts))):
-    source_prompt = prompts[i]
-    source_value = true_values[i]
-    source_params = extract_problem_params(source_prompt, EXPERIMENT)
+for idx, (source_trace, base_trace) in enumerate(pairs):
+    print(f"[{idx+1}/{len(pairs)}] Intervention: Source v={source_trace['v']}, "
+          f"Base v={base_trace['v']}, Expected time={base_trace['d']/source_trace['v']:.3f}s")
     
-    for j in range(min(N_TARGET_SAMPLES, len(prompts))):
-        if i == j:
-            continue
-        
-        target_prompt = prompts[j]
-        target_value = true_values[j]
-        target_params = extract_problem_params(target_prompt, EXPERIMENT)
-        
-        # Compute expected answers
-        if EXPERIMENT == "velocity" and 'distance' in target_params:
-            expected_with_source = target_params['distance'] / source_value
-            expected_with_target = target_params['distance'] / target_value
-        elif EXPERIMENT == "current" and 'time' in target_params:
-            expected_with_source = source_value * target_params['time']
-            expected_with_target = target_value * target_params['time']
-        else:
-            continue
-        
-        print(f"Experiment {len(all_results) + 1}: Source value={source_value:.1f}, Target value={target_value:.1f}")
-        
-        result = run_intervention_experiment(
-            source_prompt, source_value,
-            target_prompt, target_value,
-            expected_with_source, expected_with_target
-        )
-        
-        all_results.append(result)
-        
-        # Save intermediate results
-        if len(all_results) % 5 == 0:
-            output_file = OUTPUT_DIR / f"intervention_token_{EXPERIMENT}_results.json"
-            with open(output_file, 'w') as f:
-                json.dump(all_results, f, indent=2)
-            print(f"  Saved intermediate results to {output_file}")
-        
-        print()
+    result = run_intervention_experiment(source_trace, base_trace, model, tokenizer)
+    all_results.append(result)
+    
+    if result['success']:
+        print(f"    ✓ Final answer: {result.get('final_answer', 'N/A')}")
+        if result.get('final_answer') is not None:
+            print(f"      Error from intervention expectation: {result['error_from_intervention_expectation']:.3f}")
+            print(f"      Moved toward intervention: {result['moved_toward_intervention']}")
+    else:
+        print(f"    ✗ Failed: {result.get('error', 'unknown')}")
+    
+    # Save intermediate results every 25 experiments
+    if (idx + 1) % 25 == 0:
+        output_file = OUTPUT_DIR / f"intervention_token_{EXPERIMENT}_results.json"
+        with open(output_file, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\n  💾 Saved intermediate results to {output_file}\n")
+
+print()
 
 # ==========================================
 # SAVE FINAL RESULTS
@@ -481,15 +397,32 @@ print(f"Total experiments: {len(all_results)}")
 print(f"Results saved to: {output_file}")
 
 # Compute summary statistics
-successful_interventions = [r for r in all_results if r.get('intervention_success', False)]
-print(f"\nSuccessful interventions: {len(successful_interventions)}/{len(all_results)}")
+successful = [r for r in all_results if r.get('success', False)]
+print(f"\nSuccessful interventions: {len(successful)}/{len(all_results)}")
 
-if successful_interventions:
-    changed_answers = [r for r in successful_interventions if r.get('answer_changed', False)]
-    print(f"Interventions that changed answer: {len(changed_answers)}/{len(successful_interventions)}")
+if successful:
+    with_answers = [r for r in successful if r.get('final_answer') is not None]
+    print(f"Generated answers: {len(with_answers)}/{len(successful)}")
     
-    improved_toward_source = [r for r in successful_interventions 
-                             if r.get('intervention_improved_toward_source', False)]
-    print(f"Answers moved toward source expectation: {len(improved_toward_source)}/{len(successful_interventions)}")
+    if with_answers:
+        moved_toward_intervention = [r for r in with_answers if r.get('moved_toward_intervention', False)]
+        print(f"Answers moved toward intervention expectation: {len(moved_toward_intervention)}/{len(with_answers)}")
+        
+        # Average errors
+        avg_error_intervention = np.mean([r['error_from_intervention_expectation'] for r in with_answers])
+        avg_error_baseline = np.mean([r['error_from_baseline_expectation'] for r in with_answers])
+        print(f"\nAverage error from intervention expectation: {avg_error_intervention:.3f}s")
+        print(f"Average error from baseline expectation: {avg_error_baseline:.3f}s")
+
+# Report failures
+failures = [r for r in all_results if not r.get('success', False)]
+if failures:
+    print(f"\nFailure breakdown:")
+    error_types = {}
+    for r in failures:
+        error = r.get('error', 'unknown')
+        error_types[error] = error_types.get(error, 0) + 1
+    for error, count in error_types.items():
+        print(f"  {error}: {count}")
 
 print()

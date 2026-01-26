@@ -19,5 +19,5 @@ source venv/bin/activate
 
 pip install -e ../TransformerLens
 
-python linprob.py
+python intervene_patch.py
 

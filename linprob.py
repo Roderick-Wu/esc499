@@ -84,7 +84,8 @@ model = HookedTransformer.from_pretrained(
     fold_ln=False,  # Disable folding for multi-GPU compatibility
     center_writing_weights=False,  # Disable centering for multi-GPU compatibility
     fold_value_biases=False,  # Disable value bias folding for multi-GPU compatibility
-    move_to_device=False  # Don't move model - it's already distributed
+    move_to_device=False,  # Don't move model - it's already distributed
+    load_state_dict=False  # Don't reload weights - already loaded in hf_model
 )
 
 # Ensure embedding layer is on a GPU device for multi-GPU setup
@@ -110,18 +111,31 @@ print("Generating datasets...")
 # Select appropriate prompt generation functions based on experiment
 if EXPERIMENT == "velocity":
     gen_explicit = prompt_functions.gen_explicit_velocity
+    gen_solved_implicit = prompt_functions.gen_solved_implicit_velocity
     gen_implicit = lambda: prompt_functions.gen_implicit_velocity(samples_per_prompt=N_TEST_PER_FORMAT)
 elif EXPERIMENT == "current":
     gen_explicit = prompt_functions.gen_explicit_current
+    gen_solved_implicit = prompt_functions.gen_solved_implicit_current
     gen_implicit = lambda: prompt_functions.gen_implicit_current(samples_per_prompt=N_TEST_PER_FORMAT)
 else:
     raise ValueError(f"Unknown experiment: {EXPERIMENT}")
 
 # Generate explicit training data
-train_prompts, train_values = gen_explicit(n_samples=N_TRAIN_EXPLICIT)
-print(f"Generated {len(train_prompts)} explicit training prompts")
-print(f"  Example: '{train_prompts[0]}' -> {train_values[0]}")
-print(f"  Value range: [{train_values.min():.1f}, {train_values.max():.1f}]")
+train_prompts_explicit, train_values_explicit = gen_explicit(n_samples=N_TRAIN_EXPLICIT)
+print(f"Generated {len(train_prompts_explicit)} explicit training prompts")
+print(f"  Example: '{train_prompts_explicit[0]}' -> {train_values_explicit[0]}")
+print(f"  Value range: [{train_values_explicit.min():.1f}, {train_values_explicit.max():.1f}]")
+
+# Generate solved implicit training examples (implicit format but with value stated)
+print(f"\nGenerating solved implicit training examples...")
+train_prompts_solved, train_values_solved = gen_solved_implicit(n_samples=N_TRAIN_EXPLICIT // 5)
+print(f"Generated {len(train_prompts_solved)} solved implicit training prompts")
+print(f"  Example: '{train_prompts_solved[0]}' -> {train_values_solved[0]}")
+
+# Combine explicit and solved implicit training data
+train_prompts = train_prompts_explicit + train_prompts_solved
+train_values = np.concatenate([train_values_explicit, train_values_solved])
+print(f"\nTotal training prompts: {len(train_prompts)} ({len(train_prompts_explicit)} explicit + {len(train_prompts_solved)} solved implicit)")
 
 # Generate implicit test data
 test_prompts, test_prompt_ids, test_true_values = gen_implicit()
@@ -556,18 +570,18 @@ for i, layer in enumerate(LAYERS_TO_TEST):
     
     print(f"  Training on {len(train_acts)} tokens (only post-value tokens)...")
     
-    # Train MLP probe
-    print(f"  Training MLP probe...")
-    mlp_probe = train_mlp_probe(
-        train_acts, train_labels, 
-        input_dim=input_dim,
-        hidden_dim=MLP_HIDDEN_SIZE,
-        learning_rate=MLP_LEARNING_RATE,
-        epochs=MLP_EPOCHS,
-        batch_size=MLP_BATCH_SIZE,
-        device=device
-    )
-    results['mlp_probes'][layer] = mlp_probe
+    # # Train MLP probe
+    # print(f"  Training MLP probe...")
+    # mlp_probe = train_mlp_probe(
+    #     train_acts, train_labels, 
+    #     input_dim=input_dim,
+    #     hidden_dim=MLP_HIDDEN_SIZE,
+    #     learning_rate=MLP_LEARNING_RATE,
+    #     epochs=MLP_EPOCHS,
+    #     batch_size=MLP_BATCH_SIZE,
+    #     device=device
+    # )
+    # results['mlp_probes'][layer] = mlp_probe
     
     # Train Linear probe
     print(f"  Training Linear (Ridge) probe...")
@@ -575,7 +589,7 @@ for i, layer in enumerate(LAYERS_TO_TEST):
     results['linear_probes'][layer] = linear_probe
     
     # Save probes
-    torch.save(mlp_probe.state_dict(), PROBES_DIR / f'mlp_probe_layer_{layer}.pt')
+    # torch.save(mlp_probe.state_dict(), PROBES_DIR / f'mlp_probe_layer_{layer}.pt')
     joblib.dump(linear_probe, PROBES_DIR / f'linear_probe_layer_{layer}.pkl')
     
     print(f"  Training complete")
@@ -615,13 +629,13 @@ for pid in unique_prompt_ids:
     pid_true_values = test_true_values[pid_indices]
     
     # Initialize storage for predictions organized by layer and token position
-    mlp_token_predictions = {layer: [[] for _ in range(max_seq_lengths[pid])] for layer in LAYERS_TO_TEST}
+    # mlp_token_predictions = {layer: [[] for _ in range(max_seq_lengths[pid])] for layer in LAYERS_TO_TEST}
     linear_token_predictions = {layer: [[] for _ in range(max_seq_lengths[pid])] for layer in LAYERS_TO_TEST}
     token_true_values = [[] for _ in range(max_seq_lengths[pid])]
     
     # Also collect all predictions for scatter plots
-    mlp_all_predictions = {layer: [] for layer in LAYERS_TO_TEST}
-    mlp_all_true_values = {layer: [] for layer in LAYERS_TO_TEST}
+    # mlp_all_predictions = {layer: [] for layer in LAYERS_TO_TEST}
+    # mlp_all_true_values = {layer: [] for layer in LAYERS_TO_TEST}
     linear_all_predictions = {layer: [] for layer in LAYERS_TO_TEST}
     linear_all_true_values = {layer: [] for layer in LAYERS_TO_TEST}
     
@@ -633,28 +647,28 @@ for pid in unique_prompt_ids:
         # Apply all probes for all layers
         for layer in LAYERS_TO_TEST:
             test_acts = all_layer_acts[layer]
-            mlp_probe = results['mlp_probes'][layer]
+            # mlp_probe = results['mlp_probes'][layer]
             linear_probe = results['linear_probes'][layer]
             
-            # Predict using MLP
-            with torch.no_grad():
-                test_acts_tensor = torch.FloatTensor(test_acts).to(device)
-                mlp_predictions = mlp_probe(test_acts_tensor).cpu().numpy().flatten()
+            # # Predict using MLP
+            # with torch.no_grad():
+            #     test_acts_tensor = torch.FloatTensor(test_acts).to(device)
+            #     mlp_predictions = mlp_probe(test_acts_tensor).cpu().numpy().flatten()
             
             # Predict using Linear probe
             linear_predictions = linear_probe.predict(test_acts)
             
             # Store predictions by token position
-            n_tokens = len(mlp_predictions)
+            n_tokens = len(linear_predictions)
             for tok_pos in range(n_tokens):
-                mlp_token_predictions[layer][tok_pos].append(mlp_predictions[tok_pos])
+                # mlp_token_predictions[layer][tok_pos].append(mlp_predictions[tok_pos])
                 linear_token_predictions[layer][tok_pos].append(linear_predictions[tok_pos])
                 if layer == LAYERS_TO_TEST[0]:  # Only store true values once
                     token_true_values[tok_pos].append(pid_true_values[prompt_idx])
             
             # Store all predictions for scatter plots
-            mlp_all_predictions[layer].extend(mlp_predictions)
-            mlp_all_true_values[layer].extend([pid_true_values[prompt_idx]] * n_tokens)
+            # mlp_all_predictions[layer].extend(mlp_predictions)
+            # mlp_all_true_values[layer].extend([pid_true_values[prompt_idx]] * n_tokens)
             linear_all_predictions[layer].extend(linear_predictions)
             linear_all_true_values[layer].extend([pid_true_values[prompt_idx]] * n_tokens)
     
@@ -662,32 +676,33 @@ for pid in unique_prompt_ids:
     for layer_idx, layer in enumerate(LAYERS_TO_TEST):
         print(f"  Layer {layer:2d}")
         
-        token_predictions = mlp_token_predictions[layer]
+        # token_predictions = mlp_token_predictions[layer]
         token_predictions_linear = linear_token_predictions[layer]
         
-        # Compute per-token metrics for both probe types
+        # Compute per-token metrics for linear probe
         for tok_pos in range(max_seq_lengths[pid]):
-            if len(token_predictions[tok_pos]) >= 2:  # Need at least 2 samples for correlation
-                # MLP metrics
-                preds = np.array(token_predictions[tok_pos])
-                trues = np.array(token_true_values[tok_pos])
+            if len(token_predictions_linear[tok_pos]) >= 2:  # Need at least 2 samples for correlation
+                # # MLP metrics
+                # preds = np.array(token_predictions[tok_pos])
+                # trues = np.array(token_true_values[tok_pos])
                 
-                # Correlation
-                if np.std(preds) > 1e-6 and np.std(trues) > 1e-6:
-                    corr = np.corrcoef(trues, preds)[0, 1]
-                else:
-                    corr = 0.0
+                # # Correlation
+                # if np.std(preds) > 1e-6 and np.std(trues) > 1e-6:
+                #     corr = np.corrcoef(trues, preds)[0, 1]
+                # else:
+                #     corr = 0.0
                 
-                # R² and MAE
-                r2 = r2_score(trues, preds)
-                mae = mean_absolute_error(trues, preds)
+                # # R² and MAE
+                # r2 = r2_score(trues, preds)
+                # mae = mean_absolute_error(trues, preds)
                 
-                results['by_prompt_id'][pid]['per_token_correlations'][layer_idx, tok_pos] = corr
-                results['by_prompt_id'][pid]['per_token_r2_scores'][layer_idx, tok_pos] = r2
-                results['by_prompt_id'][pid]['per_token_mae_scores'][layer_idx, tok_pos] = mae
+                # results['by_prompt_id'][pid]['per_token_correlations'][layer_idx, tok_pos] = corr
+                # results['by_prompt_id'][pid]['per_token_r2_scores'][layer_idx, tok_pos] = r2
+                # results['by_prompt_id'][pid]['per_token_mae_scores'][layer_idx, tok_pos] = mae
                 
-                # Linear probe metrics (using same true values)
+                # Linear probe metrics
                 preds_linear = np.array(token_predictions_linear[tok_pos])
+                trues = np.array(token_true_values[tok_pos])
                 
                 if np.std(preds_linear) > 1e-6 and np.std(trues) > 1e-6:
                     corr_linear = np.corrcoef(trues, preds_linear)[0, 1]
@@ -702,50 +717,50 @@ for pid in unique_prompt_ids:
                 linear_results['by_prompt_id'][pid]['per_token_mae_scores'][layer_idx, tok_pos] = mae_linear
                 
                 if layer_idx == 0:  # Only count once
-                    results['by_prompt_id'][pid]['per_token_counts'][tok_pos] = len(preds)
+                    # results['by_prompt_id'][pid]['per_token_counts'][tok_pos] = len(preds)
                     linear_results['by_prompt_id'][pid]['per_token_counts'][tok_pos] = len(preds_linear)
         
-        # Report overall stats for both probe types
-        valid_corrs_mlp = results['by_prompt_id'][pid]['per_token_correlations'][layer_idx, 
-                                                                                results['by_prompt_id'][pid]['per_token_counts'] > 0]
+        # Report overall stats for linear probe
+        # valid_corrs_mlp = results['by_prompt_id'][pid]['per_token_correlations'][layer_idx, 
+        #                                                                         results['by_prompt_id'][pid]['per_token_counts'] > 0]
         valid_corrs_linear = linear_results['by_prompt_id'][pid]['per_token_correlations'][layer_idx,
                                                                                 linear_results['by_prompt_id'][pid]['per_token_counts'] > 0]
-        if len(valid_corrs_mlp) > 0:
-            mean_corr_mlp = np.mean(valid_corrs_mlp)
-            max_corr_mlp = np.max(valid_corrs_mlp)
+        if len(valid_corrs_linear) > 0:
+            # mean_corr_mlp = np.mean(valid_corrs_mlp)
+            # max_corr_mlp = np.max(valid_corrs_mlp)
             mean_corr_linear = np.mean(valid_corrs_linear)
             max_corr_linear = np.max(valid_corrs_linear)
-            print(f"  Format {pid}: MLP Mean={mean_corr_mlp:.3f}, Max={max_corr_mlp:.3f} | Linear Mean={mean_corr_linear:.3f}, Max={max_corr_linear:.3f}")
+            print(f"  Format {pid}: Linear Mean={mean_corr_linear:.3f}, Max={max_corr_linear:.3f}")
         else:
             print(f"  Format {pid}: No valid tokens")
     
     # Store all predictions for this prompt format
     for layer in LAYERS_TO_TEST:
-        results['by_prompt_id'][pid]['all_predictions'][layer] = np.array(mlp_all_predictions[layer])
-        results['by_prompt_id'][pid]['all_true_values'][layer] = np.array(mlp_all_true_values[layer])
+        # results['by_prompt_id'][pid]['all_predictions'][layer] = np.array(mlp_all_predictions[layer])
+        # results['by_prompt_id'][pid]['all_true_values'][layer] = np.array(mlp_all_true_values[layer])
         linear_results['by_prompt_id'][pid]['all_predictions'][layer] = np.array(linear_all_predictions[layer])
         linear_results['by_prompt_id'][pid]['all_true_values'][layer] = np.array(linear_all_true_values[layer])
 
-# Find best configuration (layer, token position, prompt format) for both probe types
-best_score_mlp = -np.inf
-best_config_mlp = None
+# Find best configuration (layer, token position, prompt format) for linear probe
+# best_score_mlp = -np.inf
+# best_config_mlp = None
 best_score_linear = -np.inf
 best_config_linear = None
 
 for pid in unique_prompt_ids:
-    per_token_corrs_mlp = results['by_prompt_id'][pid]['per_token_correlations']
-    per_token_counts_mlp = results['by_prompt_id'][pid]['per_token_counts']
+    # per_token_corrs_mlp = results['by_prompt_id'][pid]['per_token_correlations']
+    # per_token_counts_mlp = results['by_prompt_id'][pid]['per_token_counts']
     per_token_corrs_linear = linear_results['by_prompt_id'][pid]['per_token_correlations']
     per_token_counts_linear = linear_results['by_prompt_id'][pid]['per_token_counts']
     
     # Only consider positions with data
     for layer_idx, layer in enumerate(LAYERS_TO_TEST):
         for tok_pos in range(max_seq_lengths[pid]):
-            if per_token_counts_mlp[tok_pos] > 0:
-                corr_mlp = per_token_corrs_mlp[layer_idx, tok_pos]
-                if corr_mlp > best_score_mlp:
-                    best_score_mlp = corr_mlp
-                    best_config_mlp = (layer, tok_pos, pid)
+            # if per_token_counts_mlp[tok_pos] > 0:
+            #     corr_mlp = per_token_corrs_mlp[layer_idx, tok_pos]
+            #     if corr_mlp > best_score_mlp:
+            #         best_score_mlp = corr_mlp
+            #         best_config_mlp = (layer, tok_pos, pid)
             
             if per_token_counts_linear[tok_pos] > 0:
                 corr_linear = per_token_corrs_linear[layer_idx, tok_pos]
@@ -754,10 +769,10 @@ for pid in unique_prompt_ids:
                     best_config_linear = (layer, tok_pos, pid)
 
 print(f"\n{'='*60}")
-print(f"BEST CONFIGURATION (MLP):")
-print(f"Layer: {best_config_mlp[0]}, Token Position: {best_config_mlp[1]}, Prompt Format: {best_config_mlp[2]}")
-print(f"Correlation: {best_score_mlp:.3f}")
-print(f"\nBEST CONFIGURATION (LINEAR):")
+# print(f"BEST CONFIGURATION (MLP):")
+# print(f"Layer: {best_config_mlp[0]}, Token Position: {best_config_mlp[1]}, Prompt Format: {best_config_mlp[2]}")
+# print(f"Correlation: {best_score_mlp:.3f}")
+print(f"BEST CONFIGURATION (LINEAR):")
 print(f"Layer: {best_config_linear[0]}, Token Position: {best_config_linear[1]}, Prompt Format: {best_config_linear[2]}")
 print(f"Correlation: {best_score_linear:.3f}")
 print(f"{'='*60}\n")
@@ -797,40 +812,93 @@ for test_idx in range(len(test_prompts)):
     n_layers = len(LAYERS_TO_TEST)
     
     # Store predictions for each layer and token position
-    mlp_predictions_matrix = np.zeros((n_layers, n_tokens))
+    # mlp_predictions_matrix = np.zeros((n_layers, n_tokens))
     linear_predictions_matrix = np.zeros((n_layers, n_tokens))
     
     for i, layer in enumerate(LAYERS_TO_TEST):
         layer_acts = activations_dict[layer]  # [seq_len, d_model]
         
-        # MLP probe predictions
-        mlp_probe = results['mlp_probes'][layer]
-        mlp_probe.eval()
-        with torch.no_grad():
-            mlp_acts_tensor = torch.FloatTensor(layer_acts).to(device)
-            mlp_preds = mlp_probe(mlp_acts_tensor).cpu().numpy()
-        mlp_predictions_matrix[i, :] = mlp_preds
+        # # MLP probe predictions
+        # mlp_probe = results['mlp_probes'][layer]
+        # mlp_probe.eval()
+        # with torch.no_grad():
+        #     mlp_acts_tensor = torch.FloatTensor(layer_acts).to(device)
+        #     mlp_preds = mlp_probe(mlp_acts_tensor).cpu().numpy()
+        # mlp_predictions_matrix[i, :] = mlp_preds
         
         # Linear probe predictions
         linear_probe = results['linear_probes'][layer]
         linear_preds = linear_probe.predict(layer_acts)
         linear_predictions_matrix[i, :] = linear_preds
     
-    # Create heatmap for MLP probe
+    # # Create heatmap for MLP probe - show ERROR (true - prediction)
+    # fig, ax = plt.subplots(1, 1, figsize=(max(12, n_tokens * 0.5), 8))
+    # 
+    # # Truncate long tokens for display
+    # tokens_display = [t[:8] + '...' if len(t) > 8 else t for t in token_strings]
+    # 
+    # # Compute error: true_value - prediction (positive = underestimate, negative = overestimate)
+    # mlp_error_matrix = true_value - mlp_predictions_matrix
+    # 
+    # # Use symmetric diverging colormap centered at 0 (RdBu: red=positive error, blue=negative error)
+    # max_abs_error = max(abs(mlp_error_matrix.min()), abs(mlp_error_matrix.max()))
+    # vmin = -max_abs_error
+    # vmax = max_abs_error
+    # 
+    # im = ax.imshow(mlp_error_matrix, aspect='auto', cmap='RdBu_r', 
+    #                vmin=vmin, vmax=vmax)
+    # ax.set_xlabel('Token Position', fontsize=12)
+    # ax.set_ylabel('Layer', fontsize=12)
+    # ax.set_title(f'MLP Probe: Prediction Error (True - Predicted) per Token\n(True: {true_value:.1f})', 
+    #              fontsize=14, fontweight='bold')
+    # ax.set_yticks(range(n_layers))
+    # ax.set_yticklabels([f'L{l}' for l in LAYERS_TO_TEST])
+    # ax.set_xticks(range(n_tokens))
+    # ax.set_xticklabels(tokens_display, rotation=45, ha='right', fontsize=9)
+    # 
+    # cbar = plt.colorbar(im, ax=ax)
+    # cbar.set_label('Error (True - Pred)', fontsize=11)
+    # 
+    # # Add text annotations showing error at each position
+    # token_step, layer_step = 1, 1  # Show all annotations
+    # for i in range(0, n_layers, layer_step):
+    #     for j in range(0, n_tokens, token_step):
+    #         error_val = mlp_error_matrix[i, j]
+    #         # Choose text color for visibility
+    #         text_color = 'white' if abs(error_val) > max_abs_error * 0.5 else 'black'
+    #         text = ax.text(j, i, f'{error_val:.0f}',
+    #                       ha="center", va="center", color=text_color, fontsize=7)
+    # 
+    # # Add prompt text as subtitle (truncated if too long)
+    # prompt_display = prompt if len(prompt) < 100 else prompt[:97] + "..."
+    # plt.suptitle(f'Test Example {test_idx + 1} (Format {prompt_id})\n"{prompt_display}"', 
+    #              fontsize=13, fontweight='bold', y=0.98)
+    # plt.tight_layout()
+    # 
+    # # Save MLP heatmap
+    # filename = f'mlp_heatmap_format{prompt_id}_example{test_idx}.png'
+    # plt.savefig(PLOTS_DIR / filename, dpi=150, bbox_inches='tight')
+    # plt.close()
+    
+    # Create heatmap for Linear probe - show ERROR (true - prediction)
     fig, ax = plt.subplots(1, 1, figsize=(max(12, n_tokens * 0.5), 8))
     
     # Truncate long tokens for display
     tokens_display = [t[:8] + '...' if len(t) > 8 else t for t in token_strings]
     
-    # Heatmap: Predictions with dynamic range based on true value
-    vmin = 0
-    vmax = max(true_value * 2, mlp_predictions_matrix.max() * 1.1)
+    # Compute error: true_value - prediction
+    linear_error_matrix = true_value - linear_predictions_matrix
     
-    im = ax.imshow(mlp_predictions_matrix, aspect='auto', cmap='RdYlGn', 
+    # Use symmetric diverging colormap centered at 0
+    max_abs_error = max(abs(linear_error_matrix.min()), abs(linear_error_matrix.max()))
+    vmin = -max_abs_error
+    vmax = max_abs_error
+    
+    im = ax.imshow(linear_error_matrix, aspect='auto', cmap='RdBu_r', 
                    vmin=vmin, vmax=vmax)
     ax.set_xlabel('Token Position', fontsize=12)
     ax.set_ylabel('Layer', fontsize=12)
-    ax.set_title(f'MLP Probe: Predicted {EXPERIMENT.title()} per Token\n(True: {true_value:.1f})', 
+    ax.set_title(f'Linear Probe: Prediction Error (True - Predicted) per Token\n(True: {true_value:.1f})', 
                  fontsize=14, fontweight='bold')
     ax.set_yticks(range(n_layers))
     ax.set_yticklabels([f'L{l}' for l in LAYERS_TO_TEST])
@@ -838,53 +906,20 @@ for test_idx in range(len(test_prompts)):
     ax.set_xticklabels(tokens_display, rotation=45, ha='right', fontsize=9)
     
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label(f'{EXPERIMENT.title()}', fontsize=11)
+    cbar.set_label('Error (True - Pred)', fontsize=11)
     
-    # Add text annotations for predictions at selected positions
-    token_step = max(1, n_tokens // 10)
-    layer_step = max(1, n_layers // 8)
+    # Add text annotations showing error at each position
+    token_step, layer_step = 1, 1  # Show all annotations
     for i in range(0, n_layers, layer_step):
         for j in range(0, n_tokens, token_step):
-            text = ax.text(j, i, f'{mlp_predictions_matrix[i, j]:.0f}',
-                          ha="center", va="center", color="black", fontsize=7)
+            error_val = linear_error_matrix[i, j]
+            # Choose text color for visibility
+            text_color = 'white' if abs(error_val) > max_abs_error * 0.5 else 'black'
+            text = ax.text(j, i, f'{error_val:.0f}',
+                          ha="center", va="center", color=text_color, fontsize=7)
     
     # Add prompt text as subtitle (truncated if too long)
     prompt_display = prompt if len(prompt) < 100 else prompt[:97] + "..."
-    plt.suptitle(f'Test Example {test_idx + 1} (Format {prompt_id})\n"{prompt_display}"', 
-                 fontsize=13, fontweight='bold', y=0.98)
-    plt.tight_layout()
-    
-    # Save MLP heatmap
-    filename = f'mlp_heatmap_format{prompt_id}_example{test_idx}.png'
-    plt.savefig(PLOTS_DIR / filename, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # Create heatmap for Linear probe
-    fig, ax = plt.subplots(1, 1, figsize=(max(12, n_tokens * 0.5), 8))
-    
-    vmin = 0
-    vmax = max(true_value * 2, linear_predictions_matrix.max() * 1.1)
-    
-    im = ax.imshow(linear_predictions_matrix, aspect='auto', cmap='RdYlGn', 
-                   vmin=vmin, vmax=vmax)
-    ax.set_xlabel('Token Position', fontsize=12)
-    ax.set_ylabel('Layer', fontsize=12)
-    ax.set_title(f'Linear Probe: Predicted {EXPERIMENT.title()} per Token\n(True: {true_value:.1f})', 
-                 fontsize=14, fontweight='bold')
-    ax.set_yticks(range(n_layers))
-    ax.set_yticklabels([f'L{l}' for l in LAYERS_TO_TEST])
-    ax.set_xticks(range(n_tokens))
-    ax.set_xticklabels(tokens_display, rotation=45, ha='right', fontsize=9)
-    
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label(f'{EXPERIMENT.title()}', fontsize=11)
-    
-    # Add text annotations
-    for i in range(0, n_layers, layer_step):
-        for j in range(0, n_tokens, token_step):
-            text = ax.text(j, i, f'{linear_predictions_matrix[i, j]:.0f}',
-                          ha="center", va="center", color="black", fontsize=7)
-    
     plt.suptitle(f'Test Example {test_idx + 1} (Format {prompt_id})\n"{prompt_display}"', 
                  fontsize=13, fontweight='bold', y=0.98)
     plt.tight_layout()
@@ -895,14 +930,14 @@ for test_idx in range(len(test_prompts)):
     plt.close()
     
     # Calculate error at last token for each layer
-    mlp_last_token_errors = np.abs(mlp_predictions_matrix[:, -1] - true_value)
+    # mlp_last_token_errors = np.abs(mlp_predictions_matrix[:, -1] - true_value)
     linear_last_token_errors = np.abs(linear_predictions_matrix[:, -1] - true_value)
     
-    mlp_best_layer_idx = np.argmin(mlp_last_token_errors)
+    # mlp_best_layer_idx = np.argmin(mlp_last_token_errors)
     linear_best_layer_idx = np.argmin(linear_last_token_errors)
     
     print(f"  Tokens: {n_tokens}")
-    print(f"  MLP best layer: {LAYERS_TO_TEST[mlp_best_layer_idx]}, Error: {mlp_last_token_errors[mlp_best_layer_idx]:.1f}")
+    # print(f"  MLP best layer: {LAYERS_TO_TEST[mlp_best_layer_idx]}, Error: {mlp_last_token_errors[mlp_best_layer_idx]:.1f}")
     print(f"  Linear best layer: {LAYERS_TO_TEST[linear_best_layer_idx]}, Error: {linear_last_token_errors[linear_best_layer_idx]:.1f}")
 
 print("\nAll heatmaps generated!")
@@ -919,7 +954,7 @@ print(f"Experiment: {EXPERIMENT}")
 print(f"Training data: {N_TRAIN_EXPLICIT} explicit prompts (post-value tokens)")
 print(f"Test data: {len(test_prompts)} implicit prompts ({N_TEST_PER_FORMAT} per format)")
 print()
-print(f"Generated {len(test_prompts)} heatmap visualizations for each probe type (MLP and Linear)")
+print(f"Generated {len(test_prompts)} heatmap visualizations for Linear probes")
 print(f"Each heatmap shows predictions across {len(LAYERS_TO_TEST)} layers and all token positions")
 print(f"Prompt formats: {unique_prompt_ids}")
 print()

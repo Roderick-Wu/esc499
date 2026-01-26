@@ -52,8 +52,8 @@ MLP_BATCH_SIZE = 256  # Batch size for MLP training
 
 # CoT Generation Configuration
 MAX_NEW_TOKENS = 512  # Maximum tokens to generate (reduced to avoid OOM)
-TEMPERATURE = 0.7
-TOP_P = 0.9
+TEMPERATURE = 0.0  # Use greedy decoding (top-1 sampling) for deterministic generation
+TOP_P = 1.0  # Not used when temperature=0
 
 print(f"="*60)
 print(f"MLP PROBING WITH CHAIN-OF-THOUGHT: {EXPERIMENT.upper()}")
@@ -84,7 +84,8 @@ model = HookedTransformer.from_pretrained(
     fold_ln=False,  # Disable folding for multi-GPU compatibility
     center_writing_weights=False,  # Disable centering for multi-GPU compatibility
     fold_value_biases=False,  # Disable value bias folding for multi-GPU compatibility
-    move_to_device=False  # Don't move model - it's already distributed
+    move_to_device=False,  # Don't move model - it's already distributed
+    load_state_dict=False  # Don't reload weights - already loaded in hf_model
 )
 
 # Ensure embedding layer is on a GPU device for multi-GPU setup
@@ -338,83 +339,69 @@ def extract_post_value_activations(prompts, values, model, layer, batch_size=16)
     
     return activations, labels
 
-def extract_activations_with_generation(prompt, model, layer, max_new_tokens=512):
+def generate_and_extract_activations(prompt, model, layers, max_new_tokens=512):
     """
-    Generate chain-of-thought completion and extract activations from all tokens
-    (both prompt and generated).
+    Generate chain-of-thought completion using model.generate() and extract activations
+    from the complete sequence (prompt + generated tokens) for all specified layers.
     
     Args:
         prompt: Text prompt
         model: HookedTransformer model
-        layer: Layer index to extract from
+        layers: List of layer indices to extract from
         max_new_tokens: Maximum tokens to generate
     
     Returns:
-        Tuple of (activations, token_strings, prompt_length, generated_text)
+        Tuple of (activations_dict, token_strings, prompt_length, generated_text)
+        where activations_dict maps layer -> numpy array [seq_len, d_model]
     """
-    hook_name = f"blocks.{layer}.hook_resid_post"
     embed_device = model.embed.W_E.device
     
     # Tokenize prompt
     prompt_tokens = model.to_tokens(prompt, prepend_bos=True).to(embed_device)
     prompt_length = prompt_tokens.shape[1]
     
-    # Generate with caching
-    all_tokens = prompt_tokens.clone()
-    all_activations = []
-    
     print(f"    Generating CoT (max {max_new_tokens} tokens)...")
     
-    for step in range(max_new_tokens):
-        with torch.no_grad():
-            _, cache = model.run_with_cache(
-                all_tokens,
-                names_filter=lambda name: name == hook_name
-            )
-        
-        # Get activations for the last token
-        last_token_act = cache[hook_name][0, -1].cpu().float()  # [d_model]
-        all_activations.append(last_token_act)
-        
-        # Clear cache to save memory
-        del cache
-        if step % 10 == 0:  # Periodically clear CUDA cache
-            torch.cuda.empty_cache()
-        
-        # Get logits and sample next token
-        logits = model(all_tokens)[0, -1]  # [vocab_size]
-        
-        # Sample with temperature
-        probs = torch.softmax(logits / TEMPERATURE, dim=-1)
-        
-        # Top-p sampling
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-        mask = cumsum_probs > TOP_P
-        mask[0] = False  # Keep at least one token
-        sorted_probs[mask] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum()
-        
-        next_token_idx = sorted_indices[torch.multinomial(sorted_probs, 1)].item()
-        next_token = torch.tensor([[next_token_idx]], dtype=all_tokens.dtype, device=embed_device)
-        
-        # Check for EOS
-        if next_token_idx == model.tokenizer.eos_token_id:
-            break
-        
-        # Append token
-        all_tokens = torch.cat([all_tokens, next_token], dim=1)
+    # Generate using model.generate()
+    output_tokens = model.generate(
+        prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+        stop_at_eos=True,
+        eos_token_id=model.tokenizer.eos_token_id,
+        prepend_bos=False  # Already included in prompt_tokens
+    )
     
-    # Convert tokens to strings
-    token_strings = [model.to_string(all_tokens[0, i]) for i in range(all_tokens.shape[1])]
-    generated_text = model.to_string(all_tokens[0, prompt_length:])
+    total_length = output_tokens.shape[1]
+    generated_text = model.to_string(output_tokens[0, prompt_length:])
     
-    # Stack activations
-    activations = torch.stack(all_activations, dim=0).numpy()  # [seq_len, d_model]
+    print(f"    Generated {total_length - prompt_length} tokens")
+    print(f"    Extracting activations from all {len(layers)} layers...")
     
-    print(f"    Generated {len(generated_text)} characters in {len(all_activations)} tokens")
+    # Extract activations from all layers in a single forward pass
+    hook_names = [f"blocks.{layer}.hook_resid_post" for layer in layers]
+    with torch.no_grad():
+        _, cache = model.run_with_cache(
+            output_tokens,
+            names_filter=lambda name: name in hook_names
+        )
     
-    return activations, token_strings, prompt_length, generated_text
+    # Collect activations for each layer
+    activations_dict = {}
+    for layer in layers:
+        hook_name = f"blocks.{layer}.hook_resid_post"
+        # [batch_size, seq_len, d_model] -> [seq_len, d_model]
+        activations_dict[layer] = cache[hook_name][0].cpu().float().numpy()
+    
+    # Get token strings
+    token_strings = [model.to_string(output_tokens[0, i]) for i in range(total_length)]
+    
+    # Clear cache
+    del cache
+    torch.cuda.empty_cache()
+    
+    return activations_dict, token_strings, prompt_length, generated_text, output_tokens
 
 # ==========================================
 # TRAIN PROBES
@@ -482,34 +469,13 @@ for sample_idx in range(len(test_prompts)):
         'layers': {}
     }
     
-    # OPTIMIZATION: Generate CoT once, then extract activations from all layers on the complete sequence
-    print(f"  Generating CoT...")
-    _, token_strings, prompt_length, generated_text = extract_activations_with_generation(
-        prompt, model, LAYERS_TO_TEST[0], max_new_tokens=MAX_NEW_TOKENS
+    # Generate CoT and extract activations from all layers at once
+    print(f"  Generating CoT and extracting activations...")
+    activations_dict, token_strings, prompt_length, generated_text, full_tokens = generate_and_extract_activations(
+        prompt, model, LAYERS_TO_TEST, max_new_tokens=MAX_NEW_TOKENS
     )
     
-    # Now we have the complete token sequence - extract activations from all layers at once
-    # Reconstruct the full token sequence
-    full_tokens = model.to_tokens(prompt, prepend_bos=True)
-    embed_device = model.embed.W_E.device
-    
-    # Regenerate the same tokens (deterministic with same seed or we could cache)
-    # Actually, we need to just get the token IDs from token_strings
-    # Better approach: extract activations for all layers in one pass
-    print(f"  Generated {len(generated_text)} characters in {len(token_strings)} tokens")
-    print(f"  Extracting activations from all layers...")
-    
-    # Tokenize the full sequence (prompt + generated)
-    full_text = prompt + generated_text
-    full_tokens = model.to_tokens(full_text, prepend_bos=True).to(embed_device)
-    
-    # Extract activations from all layers in a single forward pass
-    hook_names = [f"blocks.{layer}.hook_resid_post" for layer in LAYERS_TO_TEST]
-    with torch.no_grad():
-        _, cache = model.run_with_cache(
-            full_tokens,
-            names_filter=lambda name: name in hook_names
-        )
+    print(f"  Total sequence length: {len(token_strings)} tokens (prompt: {prompt_length}, generated: {len(token_strings) - prompt_length})")
     
     # For each layer, run probe on extracted activations
     for layer in LAYERS_TO_TEST:
@@ -517,8 +483,7 @@ for sample_idx in range(len(test_prompts)):
         probe = trained_probes[layer]
         
         # Get activations for this layer
-        hook_name = f"blocks.{layer}.hook_resid_post"
-        activations = cache[hook_name][0].cpu().float().numpy()  # [seq_len, d_model]
+        activations = activations_dict[layer]  # [seq_len, d_model]
         
         # Run probe on all tokens
         with torch.no_grad():
@@ -546,24 +511,70 @@ for sample_idx in range(len(test_prompts)):
             token_str = model.to_string(full_tokens[0, idx])
             print(f"      Token {idx} ({token_type}): '{token_str[:20]}' -> {predictions[idx]:.2f}")
         
+        # Find when predictions get close to true value
+        errors = np.abs(predictions - true_value)
+        close_threshold = 5.0  # Within 5 units
+        close_positions = np.where(errors < close_threshold)[0]
+        
+        first_close_prompt = None
+        first_close_generated = None
+        if len(close_positions) > 0:
+            first_close = close_positions[0]
+            if first_close < prompt_length:
+                first_close_prompt = int(first_close)
+            else:
+                first_close_generated = int(first_close - prompt_length)
+        
         sample_result['layers'][layer] = {
             'predictions': predictions.tolist(),
-            'token_strings': [model.to_string(full_tokens[0, i]) for i in range(full_tokens.shape[1])],
+            'token_strings': token_strings,
             'prompt_length': prompt_length,
             'generated_text': generated_text,
             'prompt_mean': float(prompt_mean),
             'prompt_std': float(prompt_std),
             'generated_mean': float(generated_mean),
             'generated_std': float(generated_std),
+            'first_close_prompt': first_close_prompt,
+            'first_close_generated': first_close_generated,
+            'min_error': float(np.min(errors)),
+            'min_error_position': int(np.argmin(errors)),
         }
     
     cot_results.append(sample_result)
+    
+    # Clean up memory after each sample
+    torch.cuda.empty_cache()
 
 # Save results to JSON
 results_file = PLOTS_DIR / 'cot_analysis_results.json'
 with open(results_file, 'w') as f:
     json.dump(cot_results, f, indent=2)
 print(f"\nSaved detailed results to {results_file}")
+
+# Print summary of when values emerge
+print("\n" + "="*60)
+print("SUMMARY: When Does the Hidden Value Emerge?")
+print("="*60)
+for sample_idx, sample_result in enumerate(cot_results):
+    print(f"\nSample {sample_idx + 1} (Format {sample_result['prompt_id']}, True: {sample_result['true_value']:.1f})")
+    for layer in LAYERS_TO_TEST:
+        layer_data = sample_result['layers'][layer]
+        min_error_pos = layer_data['min_error_position']
+        min_error = layer_data['min_error']
+        
+        if min_error_pos < layer_data['prompt_length']:
+            location = f"PROMPT (token {min_error_pos})"
+        else:
+            location = f"GENERATED (token {min_error_pos - layer_data['prompt_length']})"
+        
+        print(f"  Layer {layer}: Best prediction at {location}, error={min_error:.2f}")
+        
+        if layer_data['first_close_prompt'] is not None:
+            print(f"    -> First close in PROMPT at token {layer_data['first_close_prompt']}")
+        elif layer_data['first_close_generated'] is not None:
+            print(f"    -> First close in GENERATED at token {layer_data['first_close_generated']}")
+        else:
+            print(f"    -> Never gets close to true value")
 
 # ==========================================
 # VISUALIZATION
@@ -597,6 +608,11 @@ for sample_idx, sample_result in enumerate(cot_results):
         
         # True value line
         ax.axhline(y=true_value, color='r', linestyle='--', linewidth=2, label=f'True Value ({true_value:.1f})')
+        
+        # Mark when prediction gets close
+        min_error_pos = layer_data['min_error_position']
+        ax.axvline(x=min_error_pos, color='purple', linestyle=':', linewidth=2, alpha=0.7, label='Best Prediction')
+        ax.scatter([min_error_pos], [predictions[min_error_pos]], color='purple', s=100, zorder=5)
         
         ax.set_xlabel('Token Position', fontsize=11)
         ax.set_ylabel('Probe Prediction', fontsize=11)

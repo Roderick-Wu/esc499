@@ -2,16 +2,23 @@
 Intervention Analysis for Latent Reasoning Features
 
 This script tests the causal role of learned representations by intervening on
-model activations during multi-step problem solving. It loads trained probes
-and uses them to inject or modify hidden representations at specified layers
-and token positions.
+model activations during multi-step problem solving. It uses ACTIVATION PATCHING:
+activations from one example (with hidden value V1) are extracted and patched into
+another example (with hidden value V2) to test if this causally changes the output.
 
 Workflow:
 1. Load trained probe from linprob.py experiments
 2. Generate implicit reasoning prompts (all problem types)
 3. Run baseline: generate answers without intervention
-4. Run intervention: inject probe predictions at specified layer/token
-5. Compare outputs to test if interventions improve reasoning accuracy
+4. Run intervention: patch activation from different example at specified layer/token
+5. Compare outputs to test if interventions causally affect reasoning
+
+Activation Patching Method:
+- Extract activation at (layer L, token T) from source prompt with hidden value V_source
+- Patch this activation into target prompt with hidden value V_target
+- If the activation at (L, T) causally encodes the hidden variable:
+  * The model's output should change (potentially toward V_source behavior)
+  * This demonstrates the activation's causal role in computation
 """
 
 import torch
@@ -82,21 +89,85 @@ class MLPProbe(nn.Module):
 # INTERVENTION UTILITIES
 # ==========================================
 
-def create_intervention_hook(probe, probe_type, token_position, strength=1.0, device='cuda'):
+def extract_activation(model, prompt, layer, token_position):
     """
-    Create a hook function that intervenes on activations at a specific token position.
+    Extract activation from a specific layer and token position.
     
-    The intervention works by:
-    1. Extracting the activation at the specified token position
-    2. Using the probe to predict what value should be represented
-    3. Computing a target activation that encodes this value
-    4. Replacing (or blending) the original activation with the target
+    Args:
+        model: HookedTransformer model
+        prompt: Text prompt
+        layer: Layer index to extract from
+        token_position: Token position (can be negative for indexing from end)
+    
+    Returns:
+        Activation tensor of shape [d_model] on CPU
+    """
+    hook_name = f"blocks.{layer}.hook_resid_post"
+    embed_device = model.embed.W_E.device
+    tokens = model.to_tokens(prompt, prepend_bos=True).to(embed_device)
+    
+    with torch.no_grad():
+        _, cache = model.run_with_cache(tokens, names_filter=[hook_name])
+    
+    # Extract activation at token position and move to CPU immediately
+    activation = cache[hook_name][0, token_position, :].cpu()  # [d_model]
+    
+    # Clear cache to free GPU memory
+    del cache
+    torch.cuda.empty_cache()
+    
+    return activation
+
+def create_activation_patching_hook(source_activation, token_position, strength=1.0):
+    """
+    Create a hook that patches in a source activation at a specific token position.
+    
+    This implements causal intervention by replacing the activation at token_position
+    with an activation from a different example (with a different hidden variable value).
+    
+    Args:
+        source_activation: Activation tensor to patch in [d_model] (can be on CPU)
+        token_position: Which token position to patch
+        strength: Interpolation strength (0=no change, 1=full replacement)
+    
+    Returns:
+        Hook function
+    """
+    # Move source activation to appropriate device and cache it
+    # This avoids repeated device transfers during generation
+    source_activation_cached = source_activation.clone()
+    
+    def patching_hook(activation, hook):
+        """
+        activation: [batch_size, seq_len, d_model]
+        """
+        batch_size, seq_len, d_model = activation.shape
+        
+        # Only patch if the token position exists
+        if token_position >= seq_len:
+            return activation
+        
+        # Get original activation
+        original = activation[:, token_position, :]
+        
+        # Prepare source activation (move to same device and broadcast to batch size)
+        source = source_activation_cached.to(activation.device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Patch: interpolate between original and source
+        activation[:, token_position, :] = (1 - strength) * original + strength * source
+        
+        return activation
+    
+    return patching_hook
+
+def create_probe_prediction_hook(probe, probe_type, token_position, device='cuda'):
+    """
+    Create a hook that records probe predictions (for analysis only, doesn't modify activations).
     
     Args:
         probe: Trained probe (MLPProbe or Ridge)
         probe_type: 'mlp' or 'linear'
-        token_position: Which token position to intervene on
-        strength: Intervention strength (0=no change, 1=full replacement)
+        token_position: Which token position to probe
         device: Device for computation
     
     Returns:
@@ -104,17 +175,17 @@ def create_intervention_hook(probe, probe_type, token_position, strength=1.0, de
     """
     predicted_values = []
     
-    def intervention_hook(activation, hook):
+    def prediction_hook(activation, hook):
         """
         activation: [batch_size, seq_len, d_model]
         """
         batch_size, seq_len, d_model = activation.shape
         
-        # Only intervene if the token position exists
+        # Only predict if the token position exists
         if token_position >= seq_len:
             return activation
         
-        # Extract activation at intervention token
+        # Extract activation at token position
         token_act = activation[:, token_position, :].cpu().float()  # [batch_size, d_model]
         
         # Predict value using probe
@@ -127,13 +198,9 @@ def create_intervention_hook(probe, probe_type, token_position, strength=1.0, de
         
         predicted_values.append(predicted_value)
         
-        # For now, we just record the prediction
-        # More sophisticated interventions could modify the activation
-        # based on the predicted value
-        
         return activation
     
-    return intervention_hook, predicted_values
+    return prediction_hook, predicted_values
 
 def create_activation_replacement_hook(target_activation, token_position, strength=1.0):
     """
@@ -458,6 +525,27 @@ def main():
     print("Running experiments...")
     print(f"Processing {len(test_prompts)} prompts...\n")
     
+    # Pre-extract activations from all test prompts for patching
+    print("Pre-extracting activations from all test prompts...")
+    source_activations = {}
+    for idx in tqdm(range(len(test_prompts)), desc="Extracting activations"):
+        prompt = test_prompts[idx]
+        hidden_value = test_hidden_values[idx]
+        
+        # Extract activation at intervention layer and token (returns CPU tensor)
+        activation = extract_activation(model, prompt, INTERVENTION_LAYER, INTERVENTION_TOKEN)
+        source_activations[idx] = {
+            'activation': activation,  # Already on CPU
+            'hidden_value': hidden_value,
+            'prompt': prompt
+        }
+        
+        # Periodically clear CUDA cache to prevent memory buildup
+        if (idx + 1) % 10 == 0:
+            torch.cuda.empty_cache()
+    
+    print(f"\nRunning interventions on {len(test_prompts)} prompts...")
+    
     for idx in tqdm(range(len(test_prompts)), desc="Testing interventions"):
         prompt = test_prompts[idx]
         prompt_id = test_prompt_ids[idx]
@@ -474,23 +562,56 @@ def main():
         )
         baseline_answer = extract_numerical_answer(baseline_output)
         
-        # ===== INTERVENTION: Generate with probe-based intervention =====
-        intervention_hook, predicted_values = create_intervention_hook(
-            probe, PROBE_TYPE, INTERVENTION_TOKEN,
-            strength=INTERVENTION_STRENGTH, device=device
+        # ===== INTERVENTION: Patch activation from different example =====
+        # Find a source example with a DIFFERENT hidden value
+        source_idx = None
+        for candidate_idx in range(len(test_prompts)):
+            if candidate_idx != idx and abs(test_hidden_values[candidate_idx] - hidden_value) > 2:
+                source_idx = candidate_idx
+                break
+        
+        if source_idx is None:
+            # Fallback: use first example that's different
+            for candidate_idx in range(len(test_prompts)):
+                if candidate_idx != idx:
+                    source_idx = candidate_idx
+                    break
+        
+        # Get source activation and create patching hook
+        source_activation = source_activations[source_idx]['activation']
+        source_hidden_value = source_activations[source_idx]['hidden_value']
+        
+        patching_hook = create_activation_patching_hook(
+            source_activation, INTERVENTION_TOKEN,
+            strength=INTERVENTION_STRENGTH
         )
         
         intervention_output = generate_with_intervention(
             model, prompt,
             intervention_layer=INTERVENTION_LAYER,
-            intervention_hook=intervention_hook,
+            intervention_hook=patching_hook,
             max_new_tokens=MAX_NEW_TOKENS,
             temperature=0.0
         )
         intervention_answer = extract_numerical_answer(intervention_output)
         
-        # Get probe's prediction
-        probe_prediction = predicted_values[0][0] if predicted_values else None
+        # Get probe's prediction on both original and patched activation
+        # Predict from original activation
+        orig_activation = source_activations[idx]['activation']
+        with torch.no_grad():
+            if PROBE_TYPE == 'mlp':
+                probe_prediction_orig = probe(orig_activation.unsqueeze(0).to(device)).cpu().item()
+            else:
+                probe_prediction_orig = probe.predict(orig_activation.cpu().float().numpy().reshape(1, -1))[0]
+        
+        # Predict from source (patched) activation
+        with torch.no_grad():
+            if PROBE_TYPE == 'mlp':
+                probe_prediction_source = probe(source_activation.unsqueeze(0).to(device)).cpu().item()
+            else:
+                probe_prediction_source = probe.predict(source_activation.cpu().float().numpy().reshape(1, -1))[0]
+        
+        probe_prediction = probe_prediction_orig
         
         # Store results
         sample_result = {
@@ -499,14 +620,18 @@ def main():
             'prompt': prompt,
             'hidden_value': float(hidden_value),
             'ground_truth_answer': float(ground_truth) if ground_truth is not None else None,
-            'probe_prediction': float(probe_prediction) if probe_prediction is not None else None,
+            'probe_prediction_original': float(probe_prediction_orig) if probe_prediction_orig is not None else None,
+            'probe_prediction_source': float(probe_prediction_source) if probe_prediction_source is not None else None,
+            'source_idx': int(source_idx) if source_idx is not None else None,
+            'source_hidden_value': float(source_hidden_value) if source_idx is not None else None,
             'baseline': {
                 'output': baseline_output,
                 'answer': float(baseline_answer) if baseline_answer is not None else None
             },
             'intervention': {
                 'output': intervention_output,
-                'answer': float(intervention_answer) if intervention_answer is not None else None
+                'answer': float(intervention_answer) if intervention_answer is not None else None,
+                'source_prompt': source_activations[source_idx]['prompt'] if source_idx is not None else None
             }
         }
         
@@ -520,9 +645,13 @@ def main():
                 sample_result['intervention']['error'] = abs(intervention_answer - ground_truth)
                 sample_result['intervention']['relative_error'] = abs(intervention_answer - ground_truth) / max(abs(ground_truth), 1e-6)
         
-        if probe_prediction is not None and hidden_value is not None:
-            sample_result['probe_error'] = abs(probe_prediction - hidden_value)
-            sample_result['probe_relative_error'] = abs(probe_prediction - hidden_value) / max(abs(hidden_value), 1e-6)
+        if probe_prediction_orig is not None and hidden_value is not None:
+            sample_result['probe_error_original'] = abs(probe_prediction_orig - hidden_value)
+            sample_result['probe_relative_error_original'] = abs(probe_prediction_orig - hidden_value) / max(abs(hidden_value), 1e-6)
+        
+        if probe_prediction_source is not None and source_hidden_value is not None:
+            sample_result['probe_error_source'] = abs(probe_prediction_source - source_hidden_value)
+            sample_result['probe_relative_error_source'] = abs(probe_prediction_source - source_hidden_value) / max(abs(source_hidden_value), 1e-6)
         
         results['samples'].append(sample_result)
     
@@ -569,11 +698,41 @@ def main():
                     print(f"  Samples degraded: {np.sum(improvements < 0)}/{len(improvements)}")
         
         # Probe prediction statistics
-        probe_errors = [s['probe_error'] for s in valid_samples if 'probe_error' in s]
-        if probe_errors:
-            print(f"\nProbe Prediction Quality:")
-            print(f"  Mean absolute error: {np.mean(probe_errors):.4f}")
-            print(f"  Median absolute error: {np.median(probe_errors):.4f}")
+        probe_errors_orig = [s['probe_error_original'] for s in valid_samples if 'probe_error_original' in s]
+        probe_errors_source = [s['probe_error_source'] for s in valid_samples if 'probe_error_source' in s]
+        
+        if probe_errors_orig:
+            print(f"\nProbe Prediction Quality (Original Activations):")
+            print(f"  Mean absolute error: {np.mean(probe_errors_orig):.4f}")
+            print(f"  Median absolute error: {np.median(probe_errors_orig):.4f}")
+        
+        if probe_errors_source:
+            print(f"\nProbe Prediction Quality (Source/Patched Activations):")
+            print(f"  Mean absolute error: {np.mean(probe_errors_source):.4f}")
+            print(f"  Median absolute error: {np.median(probe_errors_source):.4f}")
+        
+        # Check if interventions push toward source hidden value
+        if intervention_samples:
+            shifts_toward_source = []
+            for s in intervention_samples:
+                if s.get('source_hidden_value') is not None and s['intervention'].get('answer') is not None:
+                    orig_hidden = s['hidden_value']
+                    source_hidden = s['source_hidden_value']
+                    interv_answer = s['intervention']['answer']
+                    baseline_ans = s['baseline']['answer']
+                    
+                    # Check if intervention answer moved toward source value
+                    # (Note: answer is derived quantity, not hidden value itself)
+                    # We're checking if patching changed the output in any meaningful way
+                    if abs(interv_answer - baseline_ans) > 0.1:
+                        shifts_toward_source.append(1)
+                    else:
+                        shifts_toward_source.append(0)
+            
+            if shifts_toward_source:
+                print(f"\nIntervention Effects:")
+                print(f"  Samples with changed output: {np.sum(shifts_toward_source)}/{len(shifts_toward_source)}")
+                print(f"  Percentage affected: {100 * np.mean(shifts_toward_source):.1f}%")
     
     # Summary by prompt format
     print(f"\nResults by Prompt Format:")

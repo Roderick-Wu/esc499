@@ -143,6 +143,77 @@ def gen_explicit_current(n_samples=500):
     return prompts, np.array(values)
 
 
+# Solved implicit velocity prompts: implicit-style format but with velocity explicitly stated
+def gen_solved_implicit_velocity(n_samples=200):
+    """
+    Generate prompts that look like implicit reasoning problems but explicitly state the velocity.
+    This helps the probe learn to detect velocity representations in reasoning contexts.
+    Example: "A 5 kg car has 125 Joules of kinetic energy, moving at 10 m/s. How long does it take to travel 50 m?"
+    """
+    prompts = []
+    values = []
+    
+    objects = ["mass", "car", "train", "ball", "runner", "plane", "rocket", "vehicle"]
+    
+    templates = [
+        "A {m} kg {obj} has {ke} Joules of kinetic energy, moving at {v} m/s. How long does it take to travel {d} m?",
+        "Given a {m} kg {obj} with {ke} Joules of kinetic energy and velocity {v} m/s, calculate the time to cover {d} m.",
+        "The {obj} weighs {m} kg, has {ke} Joules of energy, and travels at {v} m/s. What is the time to traverse {d} m?",
+        "Mass: {m} kg, Kinetic Energy: {ke} Joules, Velocity: {v} m/s. Find the time to displace {d} m.",
+        "Consider a {m} kg {obj} with {ke} J kinetic energy moving at {v} m/s. Find the seconds needed to move {d} m.",
+    ]
+    
+    for _ in range(n_samples):
+        v = np.random.randint(2, 100)
+        m = np.random.randint(1, 20)
+        obj = np.random.choice(objects)
+        ke = 0.5 * m * (v ** 2)
+        d = np.random.randint(10, 100)
+        
+        template = np.random.choice(templates)
+        prompt = template.format(m=m, obj=obj, ke=f"{ke:.3e}", v=v, d=d)
+        
+        prompts.append(prompt)
+        values.append(float(v))
+    
+    return prompts, np.array(values)
+
+
+# Solved implicit current prompts: implicit-style format but with current explicitly stated
+def gen_solved_implicit_current(n_samples=200):
+    """
+    Generate prompts that look like implicit reasoning problems but explicitly state the current.
+    Example: "A resistor has 5 ohms and dissipates 125 watts, with current 5 A. How much charge flows after 10 seconds?"
+    """
+    prompts = []
+    values = []
+    
+    objects = ["device", "computer", "appliance", "gadget", "machine", "resistor"]
+    
+    templates = [
+        "A {obj} has {r} ohms of resistance and dissipates {p} watts, with current {i} A. How much charge flows through it after {t} seconds?",
+        "Given a {obj} with {r} ohms, {p} watts, and current {i} amperes, calculate the charge in Coulombs after {t} seconds.",
+        "The {obj} dissipates {p} watts across {r} ohms with {i} A current. Determine the charge transferred during {t} seconds.",
+        "Resistance: {r} ohms, Power: {p} watts, Current: {i} A. Find the charge flow in this {obj} after {t} seconds.",
+        "Consider a {obj} at {r} ohms, {p} watts, carrying {i} amperes. How many Coulombs travel through in {t} seconds?",
+    ]
+    
+    for _ in range(n_samples):
+        i = np.random.randint(2, 15)
+        r = np.random.randint(1, 10)
+        obj = np.random.choice(objects)
+        p = i ** 2 * r  # P = I^2 * R
+        t = np.random.randint(10, 100)
+        
+        template = np.random.choice(templates)
+        prompt = template.format(obj=obj, r=r, p=p, i=i, t=t)
+        
+        prompts.append(prompt)
+        values.append(float(i))
+    
+    return prompts, np.array(values)
+
+
 # Moving mass with kinetic energy --> velocity (hidden) --> travel time
 def gen_implicit_velocity(samples_per_prompt):
     prompts = []
@@ -165,7 +236,7 @@ def gen_implicit_velocity(samples_per_prompt):
             m = np.random.randint(1, 20)
             obj = np.random.choice(objects)
             ke = 0.5 * m * (v ** 2)
-            d = np.random.randint(10, 100, 10)  # Random distance for the travel time question
+            d = np.random.randint(10, 100)  # Random distance for the travel time question
         
             # Prompt: "Mass is 2kg. Energy is {KE} Joules. Therefore the velocity is"
             # We want to see if the model has 'v' ready BEFORE it generates the number.
