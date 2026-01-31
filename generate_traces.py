@@ -18,8 +18,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 import json
 import argparse
-import itertools
 from tqdm import tqdm
+import prompts
 
 # ==========================================
 # CONFIGURATION
@@ -32,7 +32,7 @@ parser.add_argument('--model_path', type=str,
                     default='/home/wuroderi/projects/def-zhijing/wuroderi/models/Qwen2.5-32B')
 parser.add_argument('--n_prompts', type=int, default=250,
                     help='Number of prompts to generate (will be split across formats)')
-parser.add_argument('--max_new_tokens', type=int, default=512,
+parser.add_argument('--max_new_tokens', type=int, default=256,
                     help='Maximum tokens to generate per prompt')
 parser.add_argument('--temperature', type=float, default=0.7)
 parser.add_argument('--top_p', type=float, default=0.9)
@@ -80,119 +80,34 @@ d_model = model.config.hidden_size
 print(f"Model loaded: {n_layers} layers, {d_model} dimensions\n")
 
 # ==========================================
-# PROMPT GENERATION (NO DUPLICATES)
+# PROMPT GENERATION
 # ==========================================
 
-def generate_unique_velocity_prompts(n_prompts):
+def generate_prompts_with_cot_wrapper(experiment_name, n_prompts):
     """
-    Generate unique velocity prompts ensuring no duplicate (m, v, d) combinations.
+    Generate prompts using the prompts module and add CoT instruction wrapper.
+    
+    Args:
+        experiment_name: Name of experiment (e.g., 'velocity_from_ke', 'current_from_power')
+        n_prompts: Total number of prompts to generate
     
     Returns:
-        List of dictionaries with keys: prompt, format_id, m, ke, d, v (hidden), expected_time
+        List of prompt dictionaries with CoT instruction added
     """
-    objects = ["mass", "car", "train", "ball", "runner", "plane", "rocket", "vehicle"]
+    # Calculate samples per format (assuming 5 formats per experiment)
+    samples_per_format = n_prompts // 5
     
-    prompt_formats = [
-        "A {m} kg {obj} has {ke} Joules of kinetic energy. How long does it take to travel {d} m?",
-        "Given a {m} kg {obj} with {ke} Joules of kinetic energy, calculate the duration required to cover a distance of {d} m.", 
-        "The {obj} weighs {m} kg and possesses {ke} Joules of kinetic energy. What is the time needed to traverse {d} m?",
-        "Mass: {m} kg, Kinetic Energy: {ke} Joules. Determine the time interval necessary for this {obj} to displace {d} m.",
-        "Consider a {m} kg {obj} with {ke} Joules of kinetic energy. Find the number of seconds needed to move {d} m."
-    ]
+    # Generate prompts using the prompts module
+    prompts_data = prompts.generate_prompts_for_experiment(experiment_name, samples_per_format)
     
-    # Generate unique combinations
-    # For velocity: we need unique (m, v, d) tuples
-    m_values = list(range(1, 21))  # 1-20 kg
-    v_values = list(range(2, 101))  # 2-100 m/s
-    d_values = list(range(10, 101))  # 10-100 m
+    # Add CoT instruction wrapper to each prompt
+    for prompt_dict in prompts_data:
+        original_prompt = prompt_dict['prompt']
+        #prompt_dict['prompt'] = f"Question: {original_prompt} Answer (step-by-step): "
+        prompt_dict['prompt'] = f"Question: {original_prompt} Answer (step-by-step): "
     
-    # Create all possible combinations
-    all_combinations = list(itertools.product(m_values, v_values, d_values))
-    
-    # Shuffle and select n_prompts
-    np.random.shuffle(all_combinations)
-    selected_combinations = all_combinations[:n_prompts]
-    
-    prompts_data = []
-    prompts_per_format = n_prompts // len(prompt_formats)
-    
-    for i, (m, v, d) in enumerate(selected_combinations):
-        format_id = i % len(prompt_formats)
-        prompt_format = prompt_formats[format_id]
-        obj = np.random.choice(objects)
-        
-        ke = 0.5 * m * (v ** 2)
-        expected_time = d / v
-        
-        prompt = prompt_format.format(m=m, obj=obj, ke=f"{ke:.3e}", d=d)
-
-        prompt = "Question: " + prompt + " Answer (step-by-step): "
-        
-        prompts_data.append({
-            'prompt': prompt,
-            'format_id': format_id,
-            'object': obj,
-            'm': m,
-            'ke': ke,
-            'd': d,
-            'v': v,  # Hidden variable
-            'expected_time': expected_time
-        })
-    
-    return prompts_data
-
-def generate_unique_current_prompts(n_prompts):
-    """
-    Generate unique current prompts ensuring no duplicate (r, i, t) combinations.
-    
-    Returns:
-        List of dictionaries with keys: prompt, format_id, r, p, t, i (hidden), expected_charge
-    """
-    objects = ["device", "computer", "appliance", "gadget", "machine", "resistor"]
-    
-    prompt_formats = [
-        "A {obj} has {r} ohms of resistance and dissipates {p} watts of power. How much charge flows through it after {t} seconds?",
-        "Given a {obj} with {r} ohms of resistance and {p} watts of power output, calculate the total charge in Coulombs that passes through over {t} seconds.", 
-        "The {obj} dissipates {p} watts across a resistance of {r} ohms. Determine the magnitude of charge transferred during a {t} second interval.", 
-        "Resistance: {r} ohms, Power: {p} watts. Find the net charge flow accumulated in this {obj} after {t} seconds.", 
-        "Consider a {obj} rated at {r} ohms and {p} watts. How many Coulombs of charge travel through this component in {t} seconds?"
-    ]
-    
-    # Generate unique combinations
-    r_values = list(range(1, 11))  # 1-10 ohms
-    i_values = list(range(2, 16))  # 2-15 A
-    t_values = list(range(10, 101))  # 10-100 seconds
-    
-    all_combinations = list(itertools.product(r_values, i_values, t_values))
-    np.random.shuffle(all_combinations)
-    selected_combinations = all_combinations[:n_prompts]
-    
-    prompts_data = []
-    
-    for i, (r, current, t) in enumerate(selected_combinations):
-        format_id = i % len(prompt_formats)
-        prompt_format = prompt_formats[format_id]
-        obj = np.random.choice(objects)
-        
-        p = current ** 2 * r  # P = I^2 * R
-        expected_charge = current * t  # Q = I * t
-        
-        prompt = prompt_format.format(obj=obj, r=r, p=p, t=t)
-
-        prompt = "Question: " + prompt + " \nAnswer (step-by-step): "
-        
-        prompts_data.append({
-            'prompt': prompt,
-            'format_id': format_id,
-            'object': obj,
-            'r': r,
-            'p': p,
-            't': t,
-            'i': current,  # Hidden variable
-            'expected_charge': expected_charge
-        })
-    
-    return prompts_data
+    # Trim to exact number requested (in case rounding created extras)
+    return prompts_data[:n_prompts]
 
 # ==========================================
 # TRACE GENERATION
@@ -243,22 +158,26 @@ def generate_trace_with_activations(prompt_text, model, tokenizer, max_new_token
     n_layers = model.config.num_hidden_layers
     all_layer_activations = {layer: [] for layer in range(n_layers)}
     
-    # For each generated token
+    # For each generated token - immediately move to CPU to free GPU memory
     for step_hidden_states in outputs.hidden_states:
         # step_hidden_states is a tuple of (n_layers + 1) tensors
         # Index 0 is embeddings, indices 1 to n_layers are transformer layers
         for layer in range(n_layers):
-            # Get the last token's hidden state for this layer
-            hidden_state = step_hidden_states[layer + 1][0, -1].cpu().float()  # [d_model]
+            # Get the last token's hidden state for this layer, immediately move to CPU
+            hidden_state = step_hidden_states[layer + 1][0, -1].cpu().float().numpy()  # [d_model]
             all_layer_activations[layer].append(hidden_state)
+    
+    # Clear outputs to free GPU memory immediately
+    del outputs
+    torch.cuda.empty_cache()
     
     print(f" [Generated {len(token_ids) - prompt_length} tokens]")
     
-    # Stack activations for each layer
+    # Stack activations for each layer (already on CPU as numpy)
     stacked_activations = {}
     for layer in range(n_layers):
         if all_layer_activations[layer]:
-            stacked_activations[layer] = torch.stack(all_layer_activations[layer], dim=0).numpy()
+            stacked_activations[layer] = np.stack(all_layer_activations[layer], axis=0)
         else:
             # If no tokens were generated, use zeros
             stacked_activations[layer] = np.zeros((0, model.config.hidden_size), dtype=np.float32)
@@ -277,14 +196,24 @@ def generate_trace_with_activations(prompt_text, model, tokenizer, max_new_token
 
 print(f"Generating {args.n_prompts} prompts...")
 
-if args.experiment == 'velocity':
-    prompts_data = generate_unique_velocity_prompts(args.n_prompts)
-elif args.experiment == 'current':
-    prompts_data = generate_unique_current_prompts(args.n_prompts)
-else:
-    raise ValueError(f"Unknown experiment: {args.experiment}")
+# Map common experiment names to their prompt generator names
+experiment_mapping = {
+    'velocity': 'velocity_from_ke',
+    'current': 'current_from_power',
+    "sample": 'velocity_from_ke',  # For quick testing
+}
 
-print(f"Generated {len(prompts_data)} unique prompts\n")
+# Get the prompt generator name
+if args.experiment in experiment_mapping:
+    prompt_experiment_name = experiment_mapping[args.experiment]
+elif args.experiment in prompts.get_all_generators():
+    prompt_experiment_name = args.experiment
+else:
+    available = list(experiment_mapping.keys()) + list(prompts.get_all_generators().keys())
+    raise ValueError(f"Unknown experiment: {args.experiment}. Available: {available}")
+
+prompts_data = generate_prompts_with_cot_wrapper(prompt_experiment_name, args.n_prompts)
+print(f"Generated {len(prompts_data)} prompts\n")
 
 # Generate traces
 all_traces = []
@@ -309,13 +238,18 @@ for idx, prompt_data in enumerate(tqdm(prompts_data, desc="Generating traces")):
     # Note: activations are stored separately to avoid huge JSON file
     all_traces.append({k: v for k, v in full_trace.items() if k != 'activations'})
     
-    # Save activations separately as numpy arrays
+    # Save activations separately as numpy arrays (immediately write to disk)
     activations_file = OUTPUT_DIR / f"trace_{idx:04d}_activations.npz"
     np.savez_compressed(
         activations_file,
         **{f"layer_{layer}": trace['activations'][layer] 
            for layer in range(n_layers)}
     )
+    
+    # Immediately clear activations from memory after saving
+    del trace['activations']
+    del full_trace
+    torch.cuda.empty_cache()
     
     # Save intermediate metadata every 50 prompts
     if (idx + 1) % 50 == 0:

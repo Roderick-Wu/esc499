@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=reasoning_abstraction_generate_data
-#SBATCH --time=0-10:00:00 # D-HH:MM
+#SBATCH --time=0-5:00:00 # D-HH:MM
 #SBATCH --account=def-zhijing
-#SBATCH --mem=256G
+#SBATCH --mem=512G
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=1
 
@@ -19,5 +19,5 @@ source venv/bin/activate
 
 pip install -e ../TransformerLens
 
-python generate_traces.py --experiment velocity --n_prompts 1 --model_path /home/wuroderi/projects/def-zhijing/wuroderi/models/QwQ-32B-Preview
-#python generate_traces.py --experiment velocity --n_prompts 250 --model_path /home/wuroderi/projects/def-zhijing/wuroderi/models/Qwen2.5-32B
+#python generate_traces.py --experiment current --n_prompts 200 --max_new_tokens 256 --model_path /home/wuroderi/projects/def-zhijing/wuroderi/models/QwQ-32B-Preview
+python generate_traces.py --experiment sample --n_prompts 200 --max_new_tokens 256 --model_path /home/wuroderi/projects/def-zhijing/wuroderi/models/Qwen2.5-32B

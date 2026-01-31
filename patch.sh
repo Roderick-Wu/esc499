@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=reasoning_abstraction
-#SBATCH --time=0-10:00:00 # D-HH:MM
+#SBATCH --time=0-2:00:00 # D-HH:MM
 #SBATCH --account=def-zhijing
-#SBATCH --mem=128G
+#SBATCH --mem=512G
 #SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=1
 
-#salloc --account=def-zhijing --mem=128G --gpus=h100:1
+#salloc --account=def-zhijing --mem=512G --gpus=h100:2
 
 # Load required modules
 #module load python/3.11.5
