@@ -200,7 +200,12 @@ print(f"Generating {args.n_prompts} prompts...")
 experiment_mapping = {
     'velocity': 'velocity_from_ke',
     'current': 'current_from_power',
-    "sample": 'velocity_from_ke',  # For quick testing
+    'radius': 'radius_from_area',
+    'side_length': 'side_length_from_volume',
+    'wavelength': 'wavelength_from_speed',
+    'cross_section': 'cross_section_from_flow',
+    'displacement': 'displacement_from_spring',
+    'market_cap': 'market_cap_from_shares'
 }
 
 # Get the prompt generator name

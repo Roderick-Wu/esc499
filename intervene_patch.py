@@ -20,6 +20,7 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 import json
+from collections import defaultdict
 
 # ==========================================
 # CONFIGURATION
@@ -101,35 +102,40 @@ def extract_prompt_from_trace(trace_text):
 
 print("Creating prompt pairs...")
 
-# Pair traces: first N with second N
-n_pairs = min(N_PROMPT_PAIRS, len(traces) // 2)
+# Extract all information from JSON and group prompts by format_id
+traces_by_format = defaultdict(list)
+for trace in traces:
+    traces_by_format[trace['format_id']].append(trace)
+
+# Ensure each format has the same number of traces
+min_traces_per_format = min(len(traces) for traces in traces_by_format.values())
+
+# Define n_pairs based on the number of traces and the pairing logic
+n_pairs = min_traces_per_format // 2
+
+# Create prompt pairs by pairing traces within the same format_id
 prompt_pairs = []
+for format_id, format_traces in traces_by_format.items():
+    for i in range(n_pairs):
+        source_trace = format_traces[i]
+        base_trace = format_traces[i + n_pairs]
 
-for i in range(n_pairs):
-    source_trace = traces[i]
-    base_trace = traces[i + n_pairs]
-    
-    # Extract just the prompts (without model generations)
-    source_prompt = extract_prompt_from_trace(source_trace['generated_text'])
-    base_prompt = extract_prompt_from_trace(base_trace['generated_text'])
-    
-    pair = {
-        'source_prompt': source_prompt,
-        'source_velocity': source_trace['v'],
-        'source_trace_id': source_trace['id'],
-        'base_prompt': base_prompt,
-        'base_velocity': base_trace['v'],
-        'base_trace_id': base_trace['id'],
-    }
-    prompt_pairs.append(pair)
+        # Extract just the prompts (without model generations)
+        source_prompt = extract_prompt_from_trace(source_trace['generated_text'])
+        base_prompt = extract_prompt_from_trace(base_trace['generated_text'])
 
-print(f"Created {len(prompt_pairs)} prompt pairs")
-print(f"\nExample pair:")
-print(f"  Source trace {prompt_pairs[0]['source_trace_id']}: velocity={prompt_pairs[0]['source_velocity']:.1f} m/s")
-print(f"  Source prompt: {prompt_pairs[0]['source_prompt'][:80]}...")
-print(f"  Base trace {prompt_pairs[0]['base_trace_id']}: velocity={prompt_pairs[0]['base_velocity']:.1f} m/s")
-print(f"  Base prompt: {prompt_pairs[0]['base_prompt'][:80]}...")
-print()
+        pair = {
+            'source_prompt': source_prompt,
+            'source_velocity': source_trace['v'],
+            'source_trace_id': source_trace['id'],
+            'base_prompt': base_prompt,
+            'base_velocity': base_trace['v'],
+            'base_trace_id': base_trace['id'],
+            'format_id': format_id
+        }
+        prompt_pairs.append(pair)
+
+print(f"Created {len(prompt_pairs)} prompt pairs grouped by format_id.")
 
 # Test question detection on example prompt
 print("Testing question detection...")
@@ -138,6 +144,20 @@ example_token_ids = example_tokens['input_ids'][0]
 print(f"Example prompt has {len(example_token_ids)} tokens")
 print(f"Example prompt: {prompt_pairs[0]['base_prompt'][:100]}...")
 print()
+
+# Ensure paired prompts have the same format_id by taking it from the JSON
+for i, pair in enumerate(prompt_pairs):
+    source_format_id = traces[i]['format_id']
+    base_format_id = traces[i + n_pairs]['format_id']
+
+    # Assign format_id from the JSON
+    pair['format_id'] = source_format_id
+
+    # Ensure source and base prompts have the same format_id
+    pair['source_format_id'] = source_format_id
+    pair['base_format_id'] = base_format_id
+
+print("Assigned format IDs to paired prompts from JSON.")
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -520,10 +540,12 @@ for pair_idx, pair in enumerate(prompt_pairs):
         
         print(f"Layer {layer}: Extracted {len(patches)} activations from source numerical values. Now patching into base and generating...")
         
-        # Get token strings for the patched positions
+        # Get token strings for the patched positions (base and source)
         base_token_strings = [get_token_string(tokenizer, pair['base_prompt'], pos) for pos in base_value_positions]
-        print(f"  Patching tokens: {base_token_strings}")
-        
+        source_token_strings = [get_token_string(tokenizer, pair['source_prompt'], pos) for pos in source_value_positions]
+        print(f"  Patching base tokens: {base_token_strings}")
+        print(f"  Using source tokens: {source_token_strings}")
+
         # Patch ALL tokens at once and generate
         intervened_output = generate_with_intervention(
             model,
@@ -531,19 +553,20 @@ for pair_idx, pair in enumerate(prompt_pairs):
             pair['base_prompt'],
             patches
         )
-        
+
         # Extract just the generated part (after prompt)
         intervened_tokens = tokenizer(intervened_output, add_special_tokens=False)['input_ids']
         generated_part = tokenizer.decode(intervened_tokens[baseline_prompt_length:], skip_special_tokens=True)
         print(f"Layer {layer} Generated: {generated_part[:80]}...")
-        
+
         # Store result
-        base_token_strings = [get_token_string(tokenizer, pair['base_prompt'], pos) for pos in base_value_positions]
         intervention_result = {
             'layer': layer,
             'num_tokens_patched': len(patches),
             'patched_positions': base_value_positions,
             'patched_tokens': base_token_strings,
+            'source_patched_positions': source_value_positions,
+            'source_patched_tokens': source_token_strings,
             'patch_description': f"KE tokens: {base_ke_positions}, mass tokens: {base_mass_positions}",
             'intervened_output': intervened_output,
             'generated_part': generated_part
@@ -581,8 +604,10 @@ with open(output_file, 'w') as f:
         
         for intervention in pair_result['interventions']:
             f.write(f"\nLayer {intervention['layer']}: Patched {intervention['num_tokens_patched']} numerical value tokens\n")
-            f.write(f"Positions: {intervention['patched_positions']} ({intervention['patch_description']})\n")
-            f.write(f"Tokens: {intervention.get('patched_tokens', [])}\n")
+            f.write(f"Base positions: {intervention['patched_positions']} ({intervention['patch_description']})\n")
+            f.write(f"Base tokens: {intervention.get('patched_tokens', [])}\n")
+            f.write(f"Source positions: {intervention.get('source_patched_positions', [])}\n")
+            f.write(f"Source tokens: {intervention.get('source_patched_tokens', [])}\n")
             f.write(f"{intervention['intervened_output']}\n")
             f.write("\n")
         
